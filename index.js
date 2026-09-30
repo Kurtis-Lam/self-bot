@@ -10,7 +10,7 @@ const serviceAccount = require("./firebase_key.json");
 // --- FIREBASE SETUP ---
 initializeApp({
   credential: cert(serviceAccount),
-  databaseURL: "https://<put-here>-default-rtdb.firebaseio.com/"
+  databaseURL: "https://<here>-default-rtdb.firebaseio.com/"
 });
 
 const db = getDatabase();
@@ -124,6 +124,58 @@ function getBestCatchName(pokemonName) {
   return cleaned;
 }
 
+function findFirstPokemonNameInMessage(cleanedContent) {
+  if (!cleanedContent || pokeVarsSet.size === 0) return null;
+  
+  const lowerContent = cleanedContent.toLowerCase();
+  let firstMatch = null;
+
+  for (const pokeVar of pokeVarsSet) {
+    if (!pokeVar) continue;
+    const target = pokeVar.toLowerCase().trim();
+    if (!target) continue;
+
+    let startPos = 0;
+    while (startPos < lowerContent.length) {
+      const index = lowerContent.indexOf(target, startPos);
+      if (index === -1) break;
+
+      const charBefore = index > 0 ? lowerContent[index - 1] : ' ';
+      const charAfter = (index + target.length < lowerContent.length) ? lowerContent[index + target.length] : ' ';
+      const isWordChar = (ch) => /[a-z0-9]/i.test(ch);
+
+      if (!isWordChar(charBefore) && !isWordChar(charAfter)) {
+        if (
+          !firstMatch ||
+          index < firstMatch.index ||
+          (index === firstMatch.index && target.length > firstMatch.name.length)
+        ) {
+          firstMatch = { name: target, index: index };
+        }
+        break;
+      }
+      startPos = index + 1;
+    }
+  }
+
+  return firstMatch ? firstMatch.name : null;
+}
+
+function isAccountMentioned(message, fullContent, targetAccId) {
+  if (!targetAccId) return false;
+  if (message.mentions && message.mentions.users && message.mentions.users.has(targetAccId)) {
+    return true;
+  }
+  if (fullContent) {
+    if (fullContent.includes(targetAccId) || 
+        fullContent.includes(`<@${targetAccId}>`) || 
+        fullContent.includes(`<@!${targetAccId}>`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function matchPokemon(spawnedName, targetName, isXnon = false) {
   const spawnLower = spawnedName.toLowerCase().trim();
   const targetLower = targetName.toLowerCase().trim();
@@ -177,11 +229,14 @@ async function updateRunningAccounts(rawTokens) {
     }
   }
 
-  currentAccounts = rawTokens.map((token, idx) => ({
-    index: idx + 1,
-    token: token,
-    id: null
-  }));
+  currentAccounts = rawTokens.map((token, idx) => {
+    const existing = currentAccounts.find(a => a.token === token);
+    return {
+      index: idx + 1,
+      token: token,
+      id: existing ? existing.id : null
+    };
+  });
 
   for (const acc of currentAccounts) {
     if (!runningClients.has(acc.token) && !startingTokens.has(acc.token)) {
@@ -252,7 +307,9 @@ function setupFirebaseListener() {
     const dbots = data.detector_bots || {};
     currentDetectorBots.clear();
     for (const guildId in dbots) {
-      dbots[guildId].forEach(botId => currentDetectorBots.add(botId));
+      if (Array.isArray(dbots[guildId])) {
+        dbots[guildId].forEach(botId => currentDetectorBots.add(botId));
+      }
     }
     
     loadPokeVars();
@@ -651,11 +708,18 @@ async function startAccountClient(acc) {
       }
 
       // --- AUTOCATCH ENGINE LOGIC ---
-      const match = cleanedContent.match(/^\s*([^:]+?):\s*\d+(?:\.\d+)?%/m);
-      if (!match) return;
+      let detectedName = findFirstPokemonNameInMessage(cleanedContent);
 
-      const rawPokemonName = match[1].trim();
-      const pokemonName = cleanPokemonName(rawPokemonName);
+      if (!detectedName) {
+        const match = cleanedContent.match(/^\s*([^:]+?):\s*\d+(?:\.\d+)?%/m);
+        if (match) {
+          detectedName = match[1].trim();
+        }
+      }
+
+      if (!detectedName) return;
+
+      const pokemonName = cleanPokemonName(detectedName);
       const finalCatchName = getBestCatchName(pokemonName);
 
       let priorityGroups = { 3: [], 2: [], 1: [] };
@@ -666,14 +730,22 @@ async function startAccountClient(acc) {
         for (const c of globalConfigs) {
           const isPaused = c.paused === true || String(c.paused).toLowerCase() === "true";
           if (c.mode === "autocatch" && !isPaused) {
+
+            const cfgAccToken = c.token || (currentAccounts[c.accIndex - 1] ? currentAccounts[c.accIndex - 1].token : null);
+            const cfgAcc = currentAccounts.find(a => a.token === cfgAccToken || a.index === c.accIndex);
+            const runningClient = cfgAccToken ? runningClients.get(cfgAccToken) : null;
+            const cfgAccId = cfgAcc?.id || runningClient?.user?.id || (cfgAccToken === acc.token ? client.user?.id : null);
+
             let allowedTargetIds = [];
             let targetPokemons = [];
+            let hasExplicitLocations = false;
 
             if (c.target) {
               const parts = c.target.split(',').map(p => p.trim()).filter(Boolean);
               for (const part of parts) {
                 if (/^\d+$/.test(part)) {
                   allowedTargetIds.push(part);
+                  hasExplicitLocations = true;
                 } else if (part.toLowerCase().endsWith('.json')) {
                   let jsonPath = path.join(DATA_DIR, "targetcatch", part);
                   if (!fs.existsSync(jsonPath)) jsonPath = path.join(DATA_DIR, part);
@@ -696,13 +768,19 @@ async function startAccountClient(acc) {
               }
             }
 
-            if (allowedTargetIds.length === 0) {
-              allowedTargetIds.push(configGuildId);
+            // Cross-server catch logic fix: strictly require mention for cross-server
+            const isCrossServer = (configGuildId !== message.guild.id);
+            if (isCrossServer) {
+              const isMentioned = isAccountMentioned(message, fullContent, cfgAccId);
+              if (!isMentioned) {
+                continue;
+              }
+            } else {
+              if (hasExplicitLocations) {
+                const locationMatch = allowedTargetIds.includes(message.guild.id) || allowedTargetIds.includes(message.channel.id);
+                if (!locationMatch) continue;
+              }
             }
-
-            const locationMatch = allowedTargetIds.includes(message.guild.id) || 
-                                  allowedTargetIds.includes(message.channel.id);
-            if (!locationMatch) continue;
 
             let isExcluded = false;
             const guildExcludes = currentConfigData.excludes[configGuildId] || [];
@@ -730,8 +808,7 @@ async function startAccountClient(acc) {
             }
 
             if (matched) {
-              const accToken = c.token || (currentAccounts[c.accIndex - 1] ? currentAccounts[c.accIndex - 1].token : null);
-              if (accToken) priorityGroups[priority].push(accToken);
+              if (cfgAccToken) priorityGroups[priority].push(cfgAccToken);
             }
           }
         }
