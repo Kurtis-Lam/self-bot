@@ -10,7 +10,7 @@ const serviceAccount = require("./firebase_key.json");
 // --- FIREBASE SETUP ---
 initializeApp({
   credential: cert(serviceAccount),
-  databaseURL: "https://<here>-default-rtdb.firebaseio.com/"
+  databaseURL: "https://<your-project-id>-default-rtdb.firebaseio.com/"
 });
 
 const db = getDatabase();
