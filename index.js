@@ -10,7 +10,7 @@ const serviceAccount = require("./firebase_key.json");
 // --- FIREBASE SETUP ---
 initializeApp({
   credential: cert(serviceAccount),
-  databaseURL: "https://<your-project-id>-default-rtdb.firebaseio.com/"
+  databaseURL: "https://versatile-kl-default-rtdb.firebaseio.com/"
 });
 
 const db = getDatabase();
@@ -371,6 +371,76 @@ function setupFirebaseListener() {
   });
 }
 
+// --- ID NAME LOOKUP (guild / channel names requested by the Python bot) ---
+const nameRequests = new Map();   // id -> { accIndex, requestedAt }
+let processingNameRequests = false;
+
+async function lookupIdName(client, id) {
+  const guild = client.guilds.cache.get(id);
+  if (guild) return { type: "guild", name: guild.name };
+
+  let channel = client.channels.cache.get(id);
+  if (!channel) channel = await client.channels.fetch(id).catch(() => null);
+  if (channel && channel.name) {
+    return { type: "channel", name: channel.name, guildName: channel.guild ? channel.guild.name : null };
+  }
+  return null;
+}
+
+async function processNameRequests() {
+  if (processingNameRequests || nameRequests.size === 0) return;
+
+  const readyClients = Array.from(runningClients.entries()).filter(([, c]) => c.isReady && c.isReady());
+  if (readyClients.length === 0) return; // retried when a client becomes ready
+
+  processingNameRequests = true;
+  try {
+    for (const [id, req] of Array.from(nameRequests.entries())) {
+      // Try the config's own (autocatch) account first, then every other logged-in account.
+      const preferredToken = currentAccounts[(req.accIndex || 0) - 1]?.token;
+      const ordered = [
+        ...readyClients.filter(([tok]) => tok === preferredToken),
+        ...readyClients.filter(([tok]) => tok !== preferredToken)
+      ];
+
+      let result = null;
+      for (const [, client] of ordered) {
+        try {
+          result = await lookupIdName(client, id);
+        } catch (_) {
+          result = null;
+        }
+        if (result) break;
+      }
+
+      // Firebase drops null values, so an unresolved ID is stored as just { checkedAt }.
+      const payload = { checkedAt: Date.now() };
+      if (result) {
+        payload.type = result.type;
+        payload.name = result.name;
+        if (result.guildName) payload.guildName = result.guildName;
+      }
+
+      await grinderRef.child("id_names").child(id).set(payload).catch(() => {});
+      await grinderRef.child("name_requests").child(id).remove().catch(() => {});
+      nameRequests.delete(id);
+      console.log(`🔎 Name lookup ${id}: ${result ? `${result.type} "${result.name}"` : "not found"}`);
+    }
+  } finally {
+    processingNameRequests = false;
+  }
+}
+
+function setupNameRequestListener() {
+  grinderRef.child("name_requests").on("value", (snapshot) => {
+    const data = snapshot.val() || {};
+    for (const id of Object.keys(data)) {
+      if (!nameRequests.has(id)) nameRequests.set(id, data[id] || {});
+    }
+    processNameRequests().catch(() => {});
+  });
+}
+
 function pauseAccountInFirebase(accIndex = null, durationMs = null) {
   let modified = false;
   const pauseUntil = durationMs ? Date.now() + durationMs : null;
@@ -584,6 +654,7 @@ async function startAccountClient(acc) {
     console.log(`[+] Logged in as Acc #${acc.index}: ${client.user.tag}`);
     const targetAcc = currentAccounts.find((a) => a.token === acc.token);
     if (targetAcc) targetAcc.id = client.user.id;
+    processNameRequests().catch(() => {});
   });
 
   client.on("messageCreate", async (message) => {
@@ -768,9 +839,11 @@ async function startAccountClient(acc) {
               }
             }
 
-            // Cross-server catch logic fix: strictly require mention for cross-server
+            // Cross-server catch logic: a config only reaches outside its own server if it
+            // has explicit location IDs. A config with no IDs stays locked to its home server.
             const isCrossServer = (configGuildId !== message.guild.id);
             if (isCrossServer) {
+              if (!hasExplicitLocations) continue;
               const isMentioned = isAccountMentioned(message, fullContent, cfgAccId);
               if (!isMentioned) {
                 continue;
@@ -878,6 +951,7 @@ async function startAccountClient(acc) {
 // --- STARTUP ---
 async function main() {
   setupFirebaseListener();
+  setupNameRequestListener();
 }
 
 main();
