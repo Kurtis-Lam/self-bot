@@ -1,3 +1,56 @@
+if (process.env.GRINDER_CHILD !== "1") {
+  const { fork } = require("child_process");
+  const RESTART_DELAY_MS = 3000;      // wait before restarting
+  const MAX_DELAY_MS = 30000;         // cap for the backoff when it keeps crashing
+  const STABLE_AFTER_MS = 60000;      // if it ran this long, the crash counter resets
+
+  let child = null;
+  let shuttingDown = false;
+  let crashStreak = 0;
+
+  const startChild = () => {
+    const startedAt = Date.now();
+    child = fork(__filename, process.argv.slice(2), {
+      env: { ...process.env, GRINDER_CHILD: "1" }
+    });
+
+    child.on("exit", (code, signal) => {
+      child = null;
+      if (shuttingDown) process.exit(0);
+      if (code === 0) {
+        console.log("[supervisor] Bot exited cleanly. Not restarting.");
+        process.exit(0);
+      }
+
+      crashStreak = (Date.now() - startedAt >= STABLE_AFTER_MS) ? 1 : crashStreak + 1;
+      const wait = Math.min(RESTART_DELAY_MS * crashStreak, MAX_DELAY_MS);
+      console.error(`[supervisor] Bot crashed (code=${code}, signal=${signal}). Restarting in ${wait / 1000}s...`);
+      setTimeout(startChild, wait);
+    });
+  };
+
+  const stop = (sig) => {
+    shuttingDown = true;
+    if (child) child.kill(sig);
+    else process.exit(0);
+  };
+  process.on("SIGINT", () => stop("SIGINT"));
+  process.on("SIGTERM", () => stop("SIGTERM"));
+
+  startChild();
+  return; // parent does nothing else; everything below runs in the child only
+}
+
+// Any unexpected error -> log it and exit with an error code so the supervisor restarts us
+process.on("uncaughtException", (err) => {
+  console.error("[FATAL] Uncaught exception:", err);
+  process.exit(1);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[FATAL] Unhandled rejection:", reason);
+  process.exit(1);
+});
+
 console.log("=== GRINDER ENGINE SCRIPT LAUNCHING ===");
 
 const { Client } = require("discord.js-selfbot-v13");
@@ -555,8 +608,27 @@ function getOrAssignCatcherForMessage(message) {
 }
 
 // --- SPAM ENGINE LOOP ---
+// For each channel, the spam accounts are shuffled into a random order. Every 1 second the
+// next account in that order sends one message (a, b, c, d, a, b, c, d, ...).
+// The order is only re-shuffled when the set of active spam accounts for that channel changes
+// (account added, removed, paused or resumed).
+function shuffleArray(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
 setInterval(() => {
-  const messages = fs.readFileSync(MESSAGES_FILE, "utf-8").split("\n").filter(l => l.trim());
+  let messages;
+  try {
+    messages = fs.readFileSync(MESSAGES_FILE, "utf-8").split("\n").filter(l => l.trim());
+  } catch (err) {
+    console.error("[-] Failed to read messages.txt:", err.message);
+    return;
+  }
   if (messages.length === 0) return;
 
   const spammersByChannel = {};
@@ -564,21 +636,33 @@ setInterval(() => {
     currentConfigData.configs[guildId].forEach(c => {
       const isPaused = c.paused === true || String(c.paused).toLowerCase() === "true";
       if (c.mode === "spam" && !isPaused && c.target) {
-        if (!spammersByChannel[c.target]) spammersByChannel[c.target] = [];
-        
+        if (!spammersByChannel[c.target]) spammersByChannel[c.target] = new Set();
+
         const accToken = c.token || (currentAccounts[c.accIndex - 1] ? currentAccounts[c.accIndex - 1].token : null);
-        if (accToken) spammersByChannel[c.target].push(accToken);
+        if (accToken) spammersByChannel[c.target].add(accToken);
       }
     });
   }
 
+  // Forget channels that no longer have any active spammers
+  for (const channelId in spamTurns) {
+    if (!spammersByChannel[channelId]) delete spamTurns[channelId];
+  }
+
   for (const channelId in spammersByChannel) {
-    const accTokens = spammersByChannel[channelId];
+    const accTokens = Array.from(spammersByChannel[channelId]);
     if (accTokens.length === 0) continue;
 
-    if (!spamTurns[channelId]) spamTurns[channelId] = 0;
-    const currentToken = accTokens[spamTurns[channelId] % accTokens.length];
-    spamTurns[channelId]++;
+    // Same group of accounts as last tick? keep the order. Otherwise shuffle a new one.
+    const groupKey = accTokens.slice().sort().join("|");
+    let state = spamTurns[channelId];
+    if (!state || state.groupKey !== groupKey) {
+      state = { groupKey, order: shuffleArray(accTokens), idx: 0 };
+      spamTurns[channelId] = state;
+    }
+
+    const currentToken = state.order[state.idx % state.order.length];
+    state.idx = (state.idx + 1) % state.order.length;
 
     if (runningClients.has(currentToken)) {
       const client = runningClients.get(currentToken);
