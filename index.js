@@ -316,11 +316,9 @@ function isAccountMentioned(message, fullContent, targetAccId) {
     return true;
   }
   if (fullContent) {
-    if (fullContent.includes(targetAccId) || 
-        fullContent.includes(`<@${targetAccId}>`) || 
-        fullContent.includes(`<@!${targetAccId}>`)) {
-      return true;
-    }
+    // Match <@id>, <@!id>, or the bare id as a standalone number (not part of a longer number/URL)
+    const re = new RegExp(`(^|[^0-9])${targetAccId}([^0-9]|$)`);
+    if (re.test(fullContent)) return true;
   }
   return false;
 }
@@ -960,10 +958,17 @@ async function startAccountClient(acc) {
 
           const { ids: allowedTargetIds, pokemons: targetPokemons, hasLocations, hasPokemonFilter } = parseAutocatchTarget(c.target);
 
-          // Scenario 1: ids were given but none of them is this server/channel -> the account
-          //             only catches if it was pinged (and the pokemon matches, if a filter is set).
-          // Scenario 2: the ids include this server/channel -> normal catching, no ping needed.
-          // No ids at all: the config only works in its own server.
+          // The account must actually be able to see this server, otherwise it can never catch here
+          // (this also stops a "mentioned" account that isn't in the server from being chosen).
+          const cfgClient = (cfgAccToken === acc.token) ? client : runningClient;
+          if (!cfgClient || !cfgClient.guilds.cache.has(message.guild.id)) continue;
+
+          // No ids given            -> only catch in the server the config was set in.
+          // Ids include this server
+          // or this channel         -> normal catching (pokemon filter still applies), no ping needed.
+          // Ids given, but none
+          // match this server/chan  -> ONLY catch if the detector message mentions this account
+          //                            (pokemon filter still applies).
           let needsPing = false;
           if (hasLocations) {
             const locationMatch = allowedTargetIds.includes(message.guild.id) || allowedTargetIds.includes(message.channel.id);
