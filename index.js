@@ -120,7 +120,8 @@ const pairTurnStates = new Map();
 const detectionAssignments = new Map(); 
 
 let spamTurns = {}; 
-const periodicMsgState = new Map(); 
+const channelDetectLock = new Map(); // channelId -> { until, messageId }
+const DETECT_LOCK_MS = 10000;
 
 let recentCatchHistory = new Map(); 
 let channelLastActionAcc = new Map(); 
@@ -162,19 +163,107 @@ function cleanPokemonName(name) {
     .replace(/[\p{Emoji}\p{Extended_Pictographic}]/gu, "")
     .toLowerCase()
     .replace(/é/g, "e")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
+// Variant prefixes that are never part of the catch name (galarian ponyta -> ponyta).
+const KNOWN_VARIANT_PREFIXES = new Set(["alolan", "galarian", "hisuian", "paldean", "christmas"]);
+
+// The name sent to Poketwo: always the base pokemon, never the variant.
 function getBestCatchName(pokemonName) {
   const cleaned = cleanPokemonName(pokemonName);
-  const words = cleaned.split(/\s+/).filter(Boolean);
+  const words = cleaned.split(" ").filter(Boolean);
   if (words.length <= 1) return cleaned;
 
-  const matchingWords = words.filter(w => pokeVarsSet.has(w));
-  if (matchingWords.length > 0) {
-    return matchingWords[matchingWords.length - 1];
+  // Longest tail of the name that is a known base pokemon ("galarian ponyta" -> "ponyta")
+  for (let i = 1; i < words.length; i++) {
+    const suffix = words.slice(i).join(" ");
+    if (pokeVarsSet.has(suffix)) return suffix;
   }
+
+  // Fallback: strip known variant prefixes
+  let i = 0;
+  while (i < words.length - 1 && KNOWN_VARIANT_PREFIXES.has(words[i])) i++;
+  if (i > 0) return words.slice(i).join(" ");
+
+  if (pokeVarsSet.has(cleaned)) return cleaned;
+
+  const matchingWords = words.filter(w => pokeVarsSet.has(w));
+  if (matchingWords.length > 0) return matchingWords[matchingWords.length - 1];
   return cleaned;
+}
+
+function escapeRegExp(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Full detected name (variant included) from a detector message.
+function extractDetectedName(cleanedContent) {
+  const scanName = findFirstPokemonNameInMessage(cleanedContent);
+
+  let rawName = null;
+  const m = cleanedContent.match(/^\s*([^:]+?):\s*\d+(?:\.\d+)?%/m);
+  if (m) rawName = cleanPokemonName(m[1]);
+
+  // "Galarian Ponyta: 97%" keeps the variant; the pokevars scan alone would only see "ponyta".
+  if (rawName) {
+    const re = new RegExp(`(^|[^a-z0-9])${escapeRegExp(scanName || "")}([^a-z0-9]|$)`);
+    if (!scanName || re.test(rawName)) return rawName;
+  }
+  return scanName;
+}
+
+// --- AUTOCATCH TARGET PARSING ---
+// Target string: "ids, pokemon names, xxx.json". Anything ending in .json is a datafile,
+// all-digit tokens are guild/channel ids, everything else is a pokemon name.
+function loadTargetFile(fileName) {
+  let jsonPath = path.join(DATA_DIR, "targetcatch", fileName);
+  if (!fs.existsSync(jsonPath)) jsonPath = path.join(DATA_DIR, fileName);
+  if (!fs.existsSync(jsonPath)) jsonPath = path.join(__dirname, fileName);
+
+  const names = [];
+  try {
+    if (fs.existsSync(jsonPath)) {
+      const jsonData = fs.readJsonSync(jsonPath);
+      const list = Array.isArray(jsonData) ? jsonData : (jsonData.pokemon || []);
+      list.forEach(p => {
+        if (typeof p === "string" && p.trim()) names.push(cleanPokemonName(p));
+      });
+    } else {
+      console.error(`[-] Datafile not found: ${fileName}`);
+    }
+  } catch (e) {
+    console.error(`[-] Failed to read datafile ${fileName}: ${e.message}`);
+  }
+  return names;
+}
+
+function parseAutocatchTarget(target) {
+  const ids = [];
+  const pokemons = [];
+  let hasPokemonFilter = false;
+
+  const parts = String(target || "").split(/[,;]/).map(p => p.trim()).filter(Boolean);
+  for (const part of parts) {
+    const nameTokens = [];
+    for (const tok of part.split(/\s+/).filter(Boolean)) {
+      if (/^\d+$/.test(tok)) {
+        ids.push(tok);
+      } else if (tok.toLowerCase().endsWith(".json")) {
+        hasPokemonFilter = true; // a datafile that is empty/missing matches nothing (never "catch everything")
+        for (const n of loadTargetFile(tok)) pokemons.push({ name: n, fromJson: true });
+      } else {
+        nameTokens.push(tok);
+      }
+    }
+    if (nameTokens.length > 0) {
+      hasPokemonFilter = true;
+      pokemons.push({ name: cleanPokemonName(nameTokens.join(" ")), fromJson: false });
+    }
+  }
+
+  return { ids, pokemons, hasLocations: ids.length > 0, hasPokemonFilter };
 }
 
 function findFirstPokemonNameInMessage(cleanedContent) {
@@ -608,17 +697,17 @@ function getOrAssignCatcherForMessage(message) {
 }
 
 // --- SPAM ENGINE LOOP ---
-// For each channel, the spam accounts are shuffled into a random order. Every 1 second the
-// next account in that order sends one message (a, b, c, d, a, b, c, d, ...).
-// The order is only re-shuffled when the set of active spam accounts for that channel changes
-// (account added, removed, paused or resumed).
-function shuffleArray(arr) {
-  const a = arr.slice();
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
+// A channel id (chid) is required. All spammers on the same channel form one group, in config
+// order: x1 sends, 1 second later x2 sends, 1 second later x3 ... then back to x1.
+async function spamSend(token, channelId, text) {
+  const client = runningClients.get(token);
+  if (!client) return;
+  const channel = client.channels.cache.get(channelId) || await client.channels.fetch(channelId).catch(() => null);
+  if (!channel) return;
+  await channel.send(text).then(() => {
+    const acc = currentAccounts.find(a => a.token === token);
+    if (acc) channelLastActionAcc.set(channelId, acc.index);
+  }).catch(() => {});
 }
 
 setInterval(() => {
@@ -631,16 +720,22 @@ setInterval(() => {
   }
   if (messages.length === 0) return;
 
+  // channelId -> ordered, de-duplicated list of spammer tokens
   const spammersByChannel = {};
   for (const guildId in currentConfigData.configs) {
     currentConfigData.configs[guildId].forEach(c => {
       const isPaused = c.paused === true || String(c.paused).toLowerCase() === "true";
-      if (c.mode === "spam" && !isPaused && c.target) {
-        if (!spammersByChannel[c.target]) spammersByChannel[c.target] = new Set();
+      if (c.mode !== "spam" || isPaused) return;
 
-        const accToken = c.token || (currentAccounts[c.accIndex - 1] ? currentAccounts[c.accIndex - 1].token : null);
-        if (accToken) spammersByChannel[c.target].add(accToken);
-      }
+      const chidMatch = String(c.target || "").match(/\d+/);
+      if (!chidMatch) return; // chid is required
+      const channelId = chidMatch[0];
+
+      const accToken = c.token || (currentAccounts[c.accIndex - 1] ? currentAccounts[c.accIndex - 1].token : null);
+      if (!accToken) return;
+
+      if (!spammersByChannel[channelId]) spammersByChannel[channelId] = [];
+      if (!spammersByChannel[channelId].includes(accToken)) spammersByChannel[channelId].push(accToken);
     });
   }
 
@@ -650,80 +745,19 @@ setInterval(() => {
   }
 
   for (const channelId in spammersByChannel) {
-    const accTokens = Array.from(spammersByChannel[channelId]);
-    if (accTokens.length === 0) continue;
+    const group = spammersByChannel[channelId];
+    const state = spamTurns[channelId] || (spamTurns[channelId] = { idx: 0 });
 
-    // Same group of accounts as last tick? keep the order. Otherwise shuffle a new one.
-    const groupKey = accTokens.slice().sort().join("|");
-    let state = spamTurns[channelId];
-    if (!state || state.groupKey !== groupKey) {
-      state = { groupKey, order: shuffleArray(accTokens), idx: 0 };
-      spamTurns[channelId] = state;
+    // Next spammer in the group that is actually logged in (skip offline ones in the same tick)
+    let token = null;
+    for (let tries = 0; tries < group.length; tries++) {
+      const candidate = group[state.idx % group.length];
+      state.idx = (state.idx + 1) % group.length;
+      if (runningClients.has(candidate)) { token = candidate; break; }
     }
+    if (!token) continue;
 
-    const currentToken = state.order[state.idx % state.order.length];
-    state.idx = (state.idx + 1) % state.order.length;
-
-    if (runningClients.has(currentToken)) {
-      const client = runningClients.get(currentToken);
-      const channel = client.channels.cache.get(channelId);
-      if (channel) {
-        const msg = messages[Math.floor(Math.random() * messages.length)];
-        channel.send(msg).then(() => {
-          const acc = currentAccounts.find(a => a.token === currentToken);
-          if (acc) channelLastActionAcc.set(channelId, acc.index);
-        }).catch(() => {});
-      }
-    }
-  }
-}, 1000);
-
-// --- PERIODIC MESSAGE ENGINE LOOP ---
-setInterval(() => {
-  const now = Date.now();
-
-  for (const guildId in currentConfigData.configs) {
-    currentConfigData.configs[guildId].forEach(c => {
-      const isPaused = c.paused === true || String(c.paused).toLowerCase() === "true";
-      if (c.mode === "periodicmsg" && !isPaused && c.target) {
-        const parts = c.target.split(';');
-        if (parts.length >= 4) {
-          const channelId = parts[0].trim();
-          const messageText = parts[1].trim();
-          const t1 = parseInt(parts[2].trim());
-          const t2 = parseInt(parts[3].trim());
-
-          if (isNaN(t1) || isNaN(t2)) return;
-
-          const accToken = c.token || (currentAccounts[c.accIndex - 1] ? currentAccounts[c.accIndex - 1].token : null);
-          const key = `${accToken}_${channelId}_${messageText}`;
-          let state = periodicMsgState.get(key);
-          
-          if (!state) {
-            state = { nextRun: now }; 
-          }
-
-          if (now >= state.nextRun) {
-            if (accToken && runningClients.has(accToken)) {
-              const client = runningClients.get(accToken);
-              const channel = client.channels.cache.get(channelId);
-              if (channel) {
-                channel.send(messageText).then(() => {
-                  const acc = currentAccounts.find(a => a.token === accToken);
-                  if (acc) channelLastActionAcc.set(channelId, acc.index);
-                }).catch(() => {});
-              }
-            }
-
-            const minMs = Math.min(t1, t2) * 1000;
-            const maxMs = Math.max(t1, t2) * 1000;
-            const waitMs = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
-            
-            periodicMsgState.set(key, { nextRun: now + waitMs });
-          }
-        }
-      }
-    });
+    spamSend(token, channelId, messages[Math.floor(Math.random() * messages.length)]);
   }
 }, 1000);
 
@@ -863,111 +897,68 @@ async function startAccountClient(acc) {
       }
 
       // --- AUTOCATCH ENGINE LOGIC ---
-      let detectedName = findFirstPokemonNameInMessage(cleanedContent);
-
-      if (!detectedName) {
-        const match = cleanedContent.match(/^\s*([^:]+?):\s*\d+(?:\.\d+)?%/m);
-        if (match) {
-          detectedName = match[1].trim();
-        }
-      }
-
+      const detectedName = extractDetectedName(cleanedContent);
       if (!detectedName) return;
 
-      const pokemonName = cleanPokemonName(detectedName);
-      const finalCatchName = getBestCatchName(pokemonName);
+      // 10s window per channel: once a detector message in this channel has been recognized,
+      // every other detector message in that channel is ignored until the window ends.
+      const nowTs = Date.now();
+      const lock = channelDetectLock.get(message.channel.id);
+      if (lock && nowTs < lock.until && lock.messageId !== message.id) return;
+
+      const pokemonName = cleanPokemonName(detectedName);   // full name, variant included
+      const finalCatchName = getBestCatchName(pokemonName); // base name actually sent to Poketwo
 
       let priorityGroups = { 3: [], 2: [], 1: [] };
 
       for (const configGuildId in currentConfigData.configs) {
         const globalConfigs = currentConfigData.configs[configGuildId] || [];
-        
+
         for (const c of globalConfigs) {
           const isPaused = c.paused === true || String(c.paused).toLowerCase() === "true";
-          if (c.mode === "autocatch" && !isPaused) {
+          if (c.mode !== "autocatch" || isPaused) continue;
 
-            const cfgAccToken = c.token || (currentAccounts[c.accIndex - 1] ? currentAccounts[c.accIndex - 1].token : null);
-            const cfgAcc = currentAccounts.find(a => a.token === cfgAccToken || a.index === c.accIndex);
-            const runningClient = cfgAccToken ? runningClients.get(cfgAccToken) : null;
-            const cfgAccId = cfgAcc?.id || runningClient?.user?.id || (cfgAccToken === acc.token ? client.user?.id : null);
+          const cfgAccToken = c.token || (currentAccounts[c.accIndex - 1] ? currentAccounts[c.accIndex - 1].token : null);
+          const cfgAcc = currentAccounts.find(a => a.token === cfgAccToken || a.index === c.accIndex);
+          const runningClient = cfgAccToken ? runningClients.get(cfgAccToken) : null;
+          const cfgAccId = cfgAcc?.id || runningClient?.user?.id || (cfgAccToken === acc.token ? client.user?.id : null);
 
-            let allowedTargetIds = [];
-            let targetPokemons = [];
-            let hasExplicitLocations = false;
+          const { ids: allowedTargetIds, pokemons: targetPokemons, hasLocations, hasPokemonFilter } = parseAutocatchTarget(c.target);
 
-            if (c.target) {
-              const parts = c.target.split(',').map(p => p.trim()).filter(Boolean);
-              for (const part of parts) {
-                if (/^\d+$/.test(part)) {
-                  allowedTargetIds.push(part);
-                  hasExplicitLocations = true;
-                } else if (part.toLowerCase().endsWith('.json')) {
-                  let jsonPath = path.join(DATA_DIR, "targetcatch", part);
-                  if (!fs.existsSync(jsonPath)) jsonPath = path.join(DATA_DIR, part);
-                  if (!fs.existsSync(jsonPath)) jsonPath = path.join(__dirname, part);
-                  
-                  try {
-                    if (fs.existsSync(jsonPath)) {
-                      const jsonData = fs.readJsonSync(jsonPath);
-                      const list = Array.isArray(jsonData) ? jsonData : (jsonData.pokemon || []);
-                      list.forEach(pName => {
-                        if (typeof pName === 'string') {
-                          targetPokemons.push({ name: pName.trim(), fromJson: true });
-                        }
-                      });
-                    }
-                  } catch (e) {}
-                } else {
-                  targetPokemons.push({ name: part, fromJson: false });
-                }
-              }
-            }
-
-            // Cross-server catch logic: a config only reaches outside its own server if it
-            // has explicit location IDs. A config with no IDs stays locked to its home server.
-            const isCrossServer = (configGuildId !== message.guild.id);
-            if (isCrossServer) {
-              if (!hasExplicitLocations) continue;
-              const isMentioned = isAccountMentioned(message, fullContent, cfgAccId);
-              if (!isMentioned) {
-                continue;
-              }
-            } else {
-              if (hasExplicitLocations) {
-                const locationMatch = allowedTargetIds.includes(message.guild.id) || allowedTargetIds.includes(message.channel.id);
-                if (!locationMatch) continue;
-              }
-            }
-
-            let isExcluded = false;
-            const guildExcludes = currentConfigData.excludes[configGuildId] || [];
-            for (const ex of guildExcludes) {
-              const exName = typeof ex === 'string' ? ex : ex.name;
-              if (matchPokemon(pokemonName, exName) || matchPokemon(finalCatchName, exName)) {
-                isExcluded = true;
-                break;
-              }
-            }
-            if (isExcluded) continue;
-
-            let priority = 1;
-            let matched = false;
-
-            if (targetPokemons.length > 0) {
-              const matchedPoke = targetPokemons.find(p => matchPokemon(pokemonName, p.name) || matchPokemon(finalCatchName, p.name));
-              if (matchedPoke) {
-                matched = true;
-                priority = matchedPoke.fromJson ? 2 : 3;
-              }
-            } else {
-              matched = true;
-              priority = 1;
-            }
-
-            if (matched) {
-              if (cfgAccToken) priorityGroups[priority].push(cfgAccToken);
-            }
+          // Scenario 1: ids were given but none of them is this server/channel -> the account
+          //             only catches if it was pinged (and the pokemon matches, if a filter is set).
+          // Scenario 2: the ids include this server/channel -> normal catching, no ping needed.
+          // No ids at all: the config only works in its own server.
+          let needsPing = false;
+          if (hasLocations) {
+            const locationMatch = allowedTargetIds.includes(message.guild.id) || allowedTargetIds.includes(message.channel.id);
+            needsPing = !locationMatch;
+          } else if (configGuildId !== message.guild.id) {
+            continue;
           }
+
+          const guildExcludes = currentConfigData.excludes[configGuildId] || [];
+          const isExcluded = guildExcludes.some(ex => {
+            const exName = cleanPokemonName(typeof ex === "string" ? ex : (ex.name || ""));
+            if (!exName) return false;
+            const xnon = typeof ex === "object" && !!ex.xnon;
+            return matchPokemon(pokemonName, exName, xnon) || matchPokemon(finalCatchName, exName, xnon);
+          });
+          if (isExcluded) continue;
+
+          // Exact match only: target "ponyta" never matches "galarian ponyta".
+          let priority = 1;
+          if (hasPokemonFilter) {
+            const matchedPoke =
+              targetPokemons.find(p => !p.fromJson && p.name === pokemonName) ||
+              targetPokemons.find(p => p.fromJson && p.name === pokemonName);
+            if (!matchedPoke) continue;
+            priority = matchedPoke.fromJson ? 2 : 3;
+          }
+
+          if (needsPing && !isAccountMentioned(message, fullContent, cfgAccId)) continue;
+
+          if (cfgAccToken) priorityGroups[priority].push(cfgAccToken);
         }
       }
 
@@ -997,6 +988,13 @@ async function startAccountClient(acc) {
 
         if (chosenToken !== null) {
           detectionAssignments.set(message.id, chosenToken);
+
+          // start the 10s window for this channel
+          channelDetectLock.set(message.channel.id, { until: Date.now() + DETECT_LOCK_MS, messageId: message.id });
+          if (channelDetectLock.size > 200) {
+            const t = Date.now();
+            for (const [k, v] of channelDetectLock) if (v.until <= t) channelDetectLock.delete(k);
+          }
           
           const cIdx = currentAccounts.findIndex(a => a.token === chosenToken) + 1;
           grinderRef.child("autocatch/current_catcher").set({
