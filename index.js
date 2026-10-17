@@ -963,18 +963,25 @@ async function startAccountClient(acc) {
           const cfgClient = (cfgAccToken === acc.token) ? client : runningClient;
           if (!cfgClient || !cfgClient.guilds.cache.has(message.guild.id)) continue;
 
-          // No ids given            -> only catch in the server the config was set in.
-          // Ids include this server
-          // or this channel         -> normal catching (pokemon filter still applies), no ping needed.
-          // Ids given, but none
-          // match this server/chan  -> ONLY catch if the detector message mentions this account
-          //                            (pokemon filter still applies).
+          // Config set in THIS server (configGuildId === message.guild.id):
+          //   no ids                  -> normal catching.
+          //   ids include this server
+          //   or this channel         -> normal catching, no ping needed.
+          //   ids given, none match   -> ONLY catch if the detector message mentions this account.
+          // Config set in ANOTHER server (cross-server, e.g. config in A targeting server B):
+          //   no ids                  -> never catch here.
+          //   ids given               -> ONLY catch if the detector message mentions this account,
+          //                              even when the ids include this server/channel.
+          //                              (pokemon filter still applies in every case)
           let needsPing = false;
-          if (hasLocations) {
-            const locationMatch = allowedTargetIds.includes(message.guild.id) || allowedTargetIds.includes(message.channel.id);
-            needsPing = !locationMatch;
-          } else if (configGuildId !== message.guild.id) {
-            continue;
+          if (configGuildId === message.guild.id) {
+            if (hasLocations) {
+              const locationMatch = allowedTargetIds.includes(message.guild.id) || allowedTargetIds.includes(message.channel.id);
+              needsPing = !locationMatch;
+            }
+          } else {
+            if (!hasLocations) continue;
+            needsPing = true;
           }
 
           const guildExcludes = currentConfigData.excludes[configGuildId] || [];
