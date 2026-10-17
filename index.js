@@ -601,11 +601,12 @@ function pauseAccountInFirebase(accIndex = null, durationMs = null) {
           ["autocatch", "spam"].includes(c.mode)) {
         c.paused = true;
         c.pauseUntil = pauseUntil;
+        c.resumeUntil = null;
         modified = true;
       }
     });
   }
-  
+
   if (modified) {
     const targetStr = accIndex === null ? "ALL accounts" : `Acc #${accIndex}`;
     const durStr = durationMs ? `for ${formatDuration(durationMs)}` : "indefinitely";
@@ -622,13 +623,23 @@ setInterval(() => {
   for (const guildId in currentConfigData.configs) {
     currentConfigData.configs[guildId].forEach(c => {
       const isPaused = c.paused === true || String(c.paused).toLowerCase() === "true";
+      const cfgAccIdx = c.token ? (currentAccounts.findIndex(a => a.token === c.token) + 1) : c.accIndex;
+
+      // "pause 40m": paused for a while, then automatically resumed
       if (isPaused && c.pauseUntil && now >= c.pauseUntil) {
         c.paused = false;
         c.pauseUntil = null;
+        c.resumeUntil = null;
         modified = true;
-        
-        const cfgAccIdx = c.token ? (currentAccounts.findIndex(a => a.token === c.token) + 1) : c.accIndex;
         console.log(`⏰ Temporary pause expired for Acc #${cfgAccIdx}. Auto-resumed.`);
+      }
+      // "resume 10s": active for a while, then automatically paused again
+      else if (!isPaused && c.resumeUntil && now >= c.resumeUntil) {
+        c.paused = true;
+        c.pauseUntil = null;
+        c.resumeUntil = null;
+        modified = true;
+        console.log(`⏰ Temporary resume expired for Acc #${cfgAccIdx}. Auto-paused.`);
       }
     });
   }
@@ -717,15 +728,22 @@ async function spamSend(token, channelId, text) {
   }).catch(() => {});
 }
 
-setInterval(() => {
-  let messages;
+const SPAM_GAP_MS = 1000;      // exact gap between two consecutive spam messages in a channel
+const SPAM_TICK_MS = 10;       // scheduler resolution
+
+function readSpamMessages() {
   try {
-    messages = fs.readFileSync(MESSAGES_FILE, "utf-8").split("\n").filter(l => l.trim());
+    return fs.readFileSync(MESSAGES_FILE, "utf-8").split("\n").filter(l => l.trim());
   } catch (err) {
     console.error("[-] Failed to read messages.txt:", err.message);
-    return;
+    return [];
   }
-  if (messages.length === 0) return;
+}
+
+// Fast tick + an absolute per-channel deadline (nextAt += 1000) instead of a plain 1s interval:
+// the gap stays exactly 1s on average and never drifts, whatever the send latency is.
+setInterval(() => {
+  const now = Date.now();
 
   // channelId -> ordered, de-duplicated list of spammer tokens
   const spammersByChannel = {};
@@ -753,9 +771,16 @@ setInterval(() => {
 
   for (const channelId in spammersByChannel) {
     const group = spammersByChannel[channelId];
-    const state = spamTurns[channelId] || (spamTurns[channelId] = { idx: 0 });
+    const state = spamTurns[channelId] || (spamTurns[channelId] = { idx: 0, nextAt: now });
 
-    // Next spammer in the group that is actually logged in (skip offline ones in the same tick)
+    if (now < state.nextAt) continue; // not this channel's turn yet
+
+    // Schedule the next slot from the previous deadline (no drift); if we fell more than
+    // a full gap behind (e.g. event loop stall), re-anchor instead of sending a burst.
+    state.nextAt += SPAM_GAP_MS;
+    if (state.nextAt <= now) state.nextAt = now + SPAM_GAP_MS;
+
+    // Next spammer in the group that is actually logged in (skip offline ones)
     let token = null;
     for (let tries = 0; tries < group.length; tries++) {
       const candidate = group[state.idx % group.length];
@@ -764,9 +789,12 @@ setInterval(() => {
     }
     if (!token) continue;
 
+    const messages = readSpamMessages();
+    if (messages.length === 0) continue;
+
     spamSend(token, channelId, messages[Math.floor(Math.random() * messages.length)]);
   }
-}, 1000);
+}, SPAM_TICK_MS);
 
 // --- BOT CLIENT ATTACHMENT ---
 async function startAccountClient(acc) {
