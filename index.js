@@ -21,6 +21,12 @@ if (process.env.GRINDER_CHILD !== "1") {
         console.log("[supervisor] Bot exited cleanly. Not restarting.");
         process.exit(0);
       }
+      if (code === 42) {
+        console.log("[supervisor] Restart requested (update). Restarting...");
+        crashStreak = 0;
+        setTimeout(startChild, 500);
+        return;
+      }
 
       crashStreak = (Date.now() - startedAt >= STABLE_AFTER_MS) ? 1 : crashStreak + 1;
       const wait = Math.min(RESTART_DELAY_MS * crashStreak, MAX_DELAY_MS);
@@ -59,6 +65,7 @@ const path = require("path");
 const { initializeApp, cert } = require("firebase-admin/app");
 const { getDatabase } = require("firebase-admin/database");
 const serviceAccount = require("./firebase_key.json");
+const { setupUpdater } = require("./pull");
 
 // --- FIREBASE SETUP ---
 initializeApp({
@@ -1034,6 +1041,7 @@ async function startAccountClient(acc) {
 async function main() {
   setupFirebaseListener();
   setupNameRequestListener();
+  setupUpdater({ db, runningClients });
 }
 
 main();
