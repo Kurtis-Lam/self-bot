@@ -963,26 +963,21 @@ async function startAccountClient(acc) {
           const cfgClient = (cfgAccToken === acc.token) ? client : runningClient;
           if (!cfgClient || !cfgClient.guilds.cache.has(message.guild.id)) continue;
 
-          // Config set in THIS server (configGuildId === message.guild.id):
-          //   no ids                  -> normal catching.
-          //   ids include this server
-          //   or this channel         -> normal catching, no ping needed.
-          //   ids given, none match   -> ONLY catch if the detector message mentions this account.
-          // Config set in ANOTHER server (cross-server, e.g. config in A targeting server B):
-          //   no ids                  -> never catch here.
-          //   ids given               -> ONLY catch if the detector message mentions this account,
-          //                              even when the ids include this server/channel.
-          //                              (pokemon filter still applies in every case)
-          let needsPing = false;
-          if (configGuildId === message.guild.id) {
-            if (hasLocations) {
-              const locationMatch = allowedTargetIds.includes(message.guild.id) || allowedTargetIds.includes(message.channel.id);
-              needsPing = !locationMatch;
-            }
-          } else {
-            if (!hasLocations) continue;
-            needsPing = true;
-          }
+          // WHERE this config listens:
+          //   * the ids in its target (guild ids and/or channel ids), or
+          //   * if the target has no ids (older configs), the server the config was created in.
+          // A config NEVER catches anywhere it does not point to.
+          const listenIds = hasLocations ? allowedTargetIds : [configGuildId];
+          const locationMatch = listenIds.includes(message.guild.id) || listenIds.includes(message.channel.id);
+          if (!locationMatch) continue;
+
+          // Message in the config's OWN server (the server it was created in):
+          //   -> normal catching, no ping needed (all pokemon, or only the targeted ones).
+          // Message in ANY OTHER server (customized guild id):
+          //   -> ONLY when the detector message pings this account. Not pinged = never catch,
+          //      even if the pokemon matches. Pinged = all pinged pokemon, or only the
+          //      pinged + targeted ones when a pokemon name / datafile is set.
+          const needsPing = message.guild.id !== configGuildId;
 
           const guildExcludes = currentConfigData.excludes[configGuildId] || [];
           const isExcluded = guildExcludes.some(ex => {
