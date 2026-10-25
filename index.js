@@ -64,13 +64,28 @@ const fs = require("fs-extra");
 const path = require("path");
 const { initializeApp, cert } = require("firebase-admin/app");
 const { getDatabase } = require("firebase-admin/database");
-const serviceAccount = require("./firebase_key.json");
 const { setupUpdater } = require("./pull");
 
 // --- FIREBASE SETUP ---
+// The Realtime Database URL is read from firebase_key.json (extra field "database_url"):
+//   { "type": "service_account", ..., "database_url": "https://<your-db-name>-default-rtdb.firebaseio.com/" }
+const FIREBASE_KEY_FILE = path.join(__dirname, "firebase_key.json");
+let serviceAccount;
+try {
+  serviceAccount = JSON.parse(fs.readFileSync(FIREBASE_KEY_FILE, "utf-8"));
+} catch (err) {
+  console.error(`[FATAL] Could not read firebase_key.json (${err.message}). Download your Firebase service account key and save it next to index.js.`);
+  process.exit(1);
+}
+const FIREBASE_DATABASE_URL = String(serviceAccount.database_url || serviceAccount.databaseURL || "").trim();
+if (!FIREBASE_DATABASE_URL) {
+  console.error('[FATAL] firebase_key.json has no "database_url" field. Add it, e.g. "database_url": "https://<your-db-name>-default-rtdb.firebaseio.com/"');
+  process.exit(1);
+}
+
 initializeApp({
   credential: cert(serviceAccount),
-  databaseURL: "https://versatile-kl-default-rtdb.firebaseio.com/"
+  databaseURL: FIREBASE_DATABASE_URL
 });
 
 const db = getDatabase();
@@ -888,7 +903,7 @@ async function startAccountClient(acc) {
           `🚨 **Captcha Detected!** Acc #${acc.index} (<@${client.user.id}>) got flagged in <#${message.channel.id}>!\n` +
           `**Message Link:** ${message.url}\n` +
           `**Verify Link:** ${verifyLink}\n\n` +
-          `*Type \`!r\` after completing verification to resume.*`, 
+          `*Complete the verification, then use \`.resume\` to resume (or \`.pause\` to pause configs).*`, 
           acc.token
         );
 
