@@ -15,7 +15,7 @@ An engine built with [`discord.js-selfbot-v13`](https://github.com/aiko-chan-ai/
 3. [Requirements](#requirements)
 4. [Step 1 - Create the Firebase project](#step-1---create-the-firebase-project)
 5. [Step 2 - Set up the engine (this repo)](#step-2---set-up-the-engine-this-repo)
-6. [Step 3 - Link it to the controller bot](#step-3---link-it-to-the-controller-bot-kurtis-lamutilities)
+6. [Step 3 - Set up the controller bot (Utilities)](#step-3---set-up-the-controller-bot-utilities)
 7. [Step 4 - First configuration from Discord](#step-4---first-configuration-from-discord)
 8. [Remote updates](#remote-updates-pull-grinder)
 9. [Firebase data layout](#firebase-data-layout)
@@ -63,14 +63,14 @@ The project is a **controller + engine** pair that talks through one shared Fire
 - **Success and alert logs** - per-server log channels.
 - **Name lookups** - the controller can ask the engine to resolve server and channel names for the config embeds.
 - **Self-supervising process** - `index.js` restarts itself with back-off if it crashes.
-- **Remote updates** - `.pull grinder` makes the engine `git pull` itself and restart.
 
 ## Requirements
 
 - [Node.js](https://nodejs.org/) **18 or newer** (LTS recommended) and npm
 - [Git](https://git-scm.com/) (needed for remote updates)
 - A free [Firebase](https://firebase.google.com/) project with a **Realtime Database**
-- A running copy of the controller bot: [Kurtis-Lam/utilities](https://github.com/Kurtis-Lam/utilities)
+- [Python](https://www.python.org/) **3.12** and pip, to run the controller bot: [Kurtis-Lam/utilities](https://github.com/Kurtis-Lam/utilities) (Step 3)
+- A Discord *bot application* (token) for the controller, created in the [Developer Portal](https://discord.com/developers/applications) (Step 3)
 - A Discord *detector bot* that posts predictions like `Galarian Ponyta: 97%` (only needed for `autocatch` and `dotcatch`)
 
 ---
@@ -152,11 +152,19 @@ node index.js
 
 You should see `=== GRINDER ENGINE SCRIPT LAUNCHING ===` followed by `🔄 Real-time Firebase sync received.`. With no accounts added yet the engine simply waits.
 
-## Step 3 - Link it to the controller bot ([Kurtis-Lam/utilities](https://github.com/Kurtis-Lam/utilities))
+## Step 3 - Set up the controller bot (Utilities)
 
-The controller is a Python Discord bot. "Linking" means giving it **the same Firebase project** as the engine.
+The engine has no commands of its own: you control it from Discord with the **Utilities** bot ([Kurtis-Lam/utilities](https://github.com/Kurtis-Lam/utilities)). This is what gives you `.grinder`, `.pause` and `.resume` (plus `.pull grinder` for remote updates). "Linking" means running Utilities with **the same Firebase project** as the engine.
 
-**3.1 Clone and install the controller**
+**3.1 Create the Discord bot application.** This is a normal bot account (not one of the self-bot accounts).
+
+1. Open the [Discord Developer Portal](https://discord.com/developers/applications) → **New Application**.
+2. Go to **Bot** → **Reset Token** and copy the token. Keep it secret.
+3. On the same page, under **Privileged Gateway Intents**, enable **Message Content Intent** and **Server Members Intent**.
+4. Go to **OAuth2 → URL Generator**, tick the scopes `bot` and `applications.commands`, give it at least *View Channels*, *Send Messages*, *Embed Links* and *Read Message History*, then open the generated URL and add the bot to your server.
+5. Copy your own Discord user ID (Discord → Settings → Advanced → enable **Developer Mode**, then right-click your name → **Copy User ID**). You will need it in step 3.4.
+
+**3.2 Clone and install Utilities** (Python 3.12 recommended)
 
 ```bash
 git clone https://github.com/Kurtis-Lam/utilities.git
@@ -166,30 +174,58 @@ pip install -r requirements.txt
 
 (`firebase-admin` is already in its `requirements.txt`.)
 
-**3.2 Give it the same credentials and database URL.** Copy the **same** `firebase_key.json` (including its `database_url` field) into the controller's root folder, next to `main.py`. The controller reads the database URL from this file too, so no code needs to be edited.
+**3.3 Give it the same credentials and database URL.** Copy the **same** `firebase_key.json` from Step 1 (including its `database_url` field) into the Utilities folder, **next to `main.py`**. Utilities reads the database URL from this file too, so no code needs to be edited.
 
-The key file used by the controller and the key file used by the engine must belong to the **same** Firebase project and contain the **same** `database_url`.
+The key file used by Utilities and the one used by the engine must belong to the **same** Firebase project and contain the **same** `database_url`.
 
-**3.3 Enable the grinder cogs.** The controller loads cogs from `config.json`. Make sure the `owner` list contains `grinder` and `pull`, and that your Discord user ID is in `OWNER_IDS` (the grinder commands are owner-only):
+**3.4 Create `config.json`** next to `main.py`. This is the smallest configuration that runs the grinder commands:
 
 ```json
 {
+  "TOKEN": "your-controller-bot-token",
+  "PREFIX": ".",
+  "POKETWO_ID": 716390085896962058,
   "OWNER_IDS": [123456789012345678],
   "COGS": {
+    "general": ["help", "ping"],
     "owner": ["utils", "grinder", "pull", "reload", "restart", "stats", "gitstats"]
   }
 }
 ```
 
-(Keep the other categories you already use in `COGS`.)
+| Key | What to put |
+| --- | --- |
+| `TOKEN` | The bot token from step 3.1. |
+| `PREFIX` | The command prefix. `.` is the default and is what this guide uses. |
+| `POKETWO_ID` | The user ID of the Pokétwo bot. Keep the value above. |
+| `OWNER_IDS` | **Your Discord user ID** (a list, so several owners are possible). `.grinder`, `.pause`, `.resume` and `.pull grinder` only work for the IDs listed here. |
+| `COGS` | Which features to load. `grinder` provides `.grinder`, `.pause` and `.resume`; `pull` provides `.pull` and `.pull grinder`. Keep them in the `owner` list. |
 
-**3.4 Start the controller** (`python main.py`) and, in a server where you are an owner, run:
+`MONGO_URI` is optional for this setup: without it Utilities prints a warning and only disables its MongoDB features, which the grinder commands do not use. You can add more cogs from the Utilities README later.
+
+**3.5 Start the controller**
+
+```bash
+python main.py
+```
+
+The bot should come online in your server. If it stops with an error instead, see [Troubleshooting](#troubleshooting).
+
+**3.6 Test the link.** In a server where the bot is present and your user ID is in `OWNER_IDS`, run:
 
 ```
 .grinder
 ```
 
-If the bot answers with the *Mode Configurations* panel, the link works: the controller can read and write the same `/grinder` node the engine is listening to. Adding an account in the panel makes the engine log it in within a second or two.
+If the bot answers with the *Mode Configurations* panel, the link works: the controller can read and write the same `/grinder` node the engine is listening to. The three commands you will use every day are:
+
+| Command | What it does |
+| --- | --- |
+| `.grinder` | Opens the configuration panel (accounts, configs, excludes, detector bots, logs) and adds/removes configs. |
+| `.pause [numbers] [time]` | Pauses configs. With no arguments it pauses **all** of them, e.g. `.pause 1 30m` pauses config #1 for 30 minutes. |
+| `.resume [numbers] [time]` | Resumes configs. With no arguments it resumes **all** of them. A duration such as `.resume 10s` keeps them running for that long, then pauses them again. |
+
+They are owner-only, work as `.command` or `/command`, and only work inside a server (not in DMs).
 
 ## Step 4 - First configuration from Discord
 
@@ -253,6 +289,9 @@ Used by the updater (`pull.js`); all optional.
 | --- | --- |
 | `Could not read firebase_key.json` | The key file is missing or misnamed. It must sit next to `index.js` (and next to `main.py` for the controller). |
 | `firebase_key.json has no "database_url" field` | Add `"database_url": "https://<your-db-name>-default-rtdb.firebaseio.com/"` to the key file (see Step 1). |
+| The controller exits with `PrivilegedIntentsRequired` | Enable **Message Content Intent** and **Server Members Intent** for the controller bot in the Developer Portal (step 3.1). |
+| `❌ Error: 'TOKEN' missing` / `'POKETWO_ID' missing` / `config.json file not found` | `config.json` must sit next to `main.py` and contain at least `TOKEN`, `POKETWO_ID`, `OWNER_IDS` and `COGS` (step 3.4). |
+| The controller is online but `.grinder`, `.pause` or `.resume` do nothing or say *for the bot owners only* | Your user ID is not in `OWNER_IDS`, `grinder` is missing from the `owner` list in `COGS`, or you used the command in a DM. Restart the controller after editing `config.json`. |
 | `.grinder` shows nothing / Firebase errors in the controller | The controller's `firebase_key.json` (key or `database_url`) does not match the engine's. |
 | Engine says `Real-time Firebase sync received` but no account logs in | No accounts added yet, or the token is invalid/expired (`[-] Failed to login Acc #N`). |
 | Autocatch does nothing | No detector bot added for that server, the detector's message format is not `Name: 97%`, the Pokémon is excluded, or the account is not in the server. See [MODES.md](MODES.md#autocatch). |
