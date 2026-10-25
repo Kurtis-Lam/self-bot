@@ -143,7 +143,7 @@ const detectionAssignments = new Map();
 
 let spamTurns = {}; 
 const channelDetectLock = new Map(); // channelId -> { until, messageId }
-const DETECT_LOCK_MS = 10000;
+const DETECT_LOCK_MS = 9000;
 
 let recentCatchHistory = new Map(); 
 let channelLastActionAcc = new Map(); 
