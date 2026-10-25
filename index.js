@@ -143,7 +143,7 @@ const detectionAssignments = new Map();
 
 let spamTurns = {}; 
 const channelDetectLock = new Map(); // channelId -> { until, messageId }
-const DETECT_LOCK_MS = 9000;
+const DETECT_LOCK_MS = 7500;
 
 let recentCatchHistory = new Map(); 
 let channelLastActionAcc = new Map(); 
@@ -948,7 +948,7 @@ async function startAccountClient(acc) {
       const detectedName = extractDetectedName(cleanedContent);
       if (!detectedName) return;
 
-      // 10s window per channel: once a detector message in this channel has been recognized,
+      // 7.5s window per channel: once a detector message in this channel has been recognized,
       // every other detector message in that channel is ignored until the window ends.
       const nowTs = Date.now();
       const lock = channelDetectLock.get(message.channel.id);
@@ -989,10 +989,12 @@ async function startAccountClient(acc) {
           // Message in the config's OWN server (the server it was created in):
           //   -> normal catching, no ping needed (all pokemon, or only the targeted ones).
           // Message in ANY OTHER server (customized guild id):
-          //   -> ONLY when the detector message pings this account. Not pinged = never catch,
-          //      even if the pokemon matches. Pinged = all pinged pokemon, or only the
+          //   -> with --pingonly (pingOnly: true): ONLY when the detector message pings this account.
+          //      Not pinged = never catch. Pinged = all pinged pokemon, or only the
           //      pinged + targeted ones when a pokemon name / datafile is set.
-          const needsPing = message.guild.id !== configGuildId;
+          //   -> without --pingonly: catches regardless of whether the account was pinged.
+          const pingOnly = c.pingOnly === true || String(c.pingOnly).toLowerCase() === "true";
+          const needsPing = pingOnly && message.guild.id !== configGuildId;
 
           const guildExcludes = currentConfigData.excludes[configGuildId] || [];
           const isExcluded = guildExcludes.some(ex => {
@@ -1046,7 +1048,7 @@ async function startAccountClient(acc) {
         if (chosenToken !== null) {
           detectionAssignments.set(message.id, chosenToken);
 
-          // start the 10s window for this channel
+          // start the 7.5s window for this channel
           channelDetectLock.set(message.channel.id, { until: Date.now() + DETECT_LOCK_MS, messageId: message.id });
           if (channelDetectLock.size > 200) {
             const t = Date.now();
