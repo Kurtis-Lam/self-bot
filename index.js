@@ -110,7 +110,11 @@ function loadPokeVars() {
       pokeVarsSet.clear();
       if (Array.isArray(data)) {
         data.forEach(item => {
-          if (typeof item === 'string') pokeVarsSet.add(item.toLowerCase().trim());
+          // Normalize exactly like cleanPokemonName (é -> e, emoji stripped) so "Flabébé" is stored as "flabebe"
+          if (typeof item === 'string') {
+            const normalized = cleanPokemonName(item);
+            if (normalized) pokeVarsSet.add(normalized);
+          }
         });
       }
     }
@@ -291,7 +295,8 @@ function parseAutocatchTarget(target) {
 function findFirstPokemonNameInMessage(cleanedContent) {
   if (!cleanedContent || pokeVarsSet.size === 0) return null;
   
-  const lowerContent = cleanedContent.toLowerCase();
+  // Same accent normalization as the pokevars set, so "Flabébé" in a message matches "flabebe"
+  const lowerContent = cleanedContent.toLowerCase().replace(/é/g, "e");
   let firstMatch = null;
 
   for (const pokeVar of pokeVarsSet) {
