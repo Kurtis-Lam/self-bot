@@ -44,10 +44,9 @@ if (process.env.GRINDER_CHILD !== "1") {
   process.on("SIGTERM", () => stop("SIGTERM"));
 
   startChild();
-  return; // parent does nothing else; everything below runs in the child only
+  return; 
 }
 
-// Any unexpected error -> log it and exit with an error code so the supervisor restarts us
 process.on("uncaughtException", (err) => {
   console.error("[FATAL] Uncaught exception:", err);
   process.exit(1);
@@ -57,7 +56,7 @@ process.on("unhandledRejection", (reason) => {
   process.exit(1);
 });
 
-console.log("=== GRINDER ENGINE SCRIPT LAUNCHING ===");
+console.log("=== GRINDER ENGINE SCRIPT LAUNCHING (ENHANCED SPOOFING & BEHAVIOR) ===");
 
 const { Client } = require("discord.js-selfbot-v13");
 const fs = require("fs-extra");
@@ -67,19 +66,17 @@ const { getDatabase } = require("firebase-admin/database");
 const { setupUpdater } = require("./pull");
 
 // --- FIREBASE SETUP ---
-// The Realtime Database URL is read from firebase_key.json (extra field "database_url"):
-//   { "type": "service_account", ..., "database_url": "https://<your-db-name>-default-rtdb.firebaseio.com/" }
 const FIREBASE_KEY_FILE = path.join(__dirname, "firebase_key.json");
 let serviceAccount;
 try {
   serviceAccount = JSON.parse(fs.readFileSync(FIREBASE_KEY_FILE, "utf-8"));
 } catch (err) {
-  console.error(`[FATAL] Could not read firebase_key.json (${err.message}). Download your Firebase service account key and save it next to index.js.`);
+  console.error(`[FATAL] Could not read firebase_key.json (${err.message}).`);
   process.exit(1);
 }
 const FIREBASE_DATABASE_URL = String(serviceAccount.database_url || serviceAccount.databaseURL || "").trim();
 if (!FIREBASE_DATABASE_URL) {
-  console.error('[FATAL] firebase_key.json has no "database_url" field. Add it, e.g. "database_url": "https://<your-db-name>-default-rtdb.firebaseio.com/"');
+  console.error('[FATAL] firebase_key.json has no "database_url" field.');
   process.exit(1);
 }
 
@@ -110,7 +107,6 @@ function loadPokeVars() {
       pokeVarsSet.clear();
       if (Array.isArray(data)) {
         data.forEach(item => {
-          // Normalize exactly like cleanPokemonName (é -> e, emoji stripped) so "Flabébé" is stored as "flabebe"
           if (typeof item === 'string') {
             const normalized = cleanPokemonName(item);
             if (normalized) pokeVarsSet.add(normalized);
@@ -137,7 +133,7 @@ let currentConfigData = {
 };
 
 const runningClients = new Map(); 
-const startingTokens = new Set(); // Prevent duplicate login race conditions
+const startingTokens = new Set(); 
 const dotcatchWaiters = new Map(); 
 
 let currentAutocatchPairs = [];
@@ -146,14 +142,14 @@ const pairTurnStates = new Map();
 const detectionAssignments = new Map(); 
 
 let spamTurns = {}; 
-const channelDetectLock = new Map(); // channelId -> { until, messageId }
+const channelDetectLock = new Map(); 
 const DETECT_LOCK_MS = 7500;
 
 let recentCatchHistory = new Map(); 
 let channelLastActionAcc = new Map(); 
 const recentCatchAttempts = new Map(); 
 
-// --- DURATION & DELAY UTILITIES ---
+// --- UTILITIES ---
 function parseDuration(str) {
   if (!str) return null;
   const match = str.match(/^(\d+)([smhd])?$/i);
@@ -183,7 +179,13 @@ function delay(ms) {
   return new Promise((res) => setTimeout(res, ms));
 }
 
-// --- POKEMON CLEANING & MATCHING UTILITIES ---
+// --- HUMAN BEHAVIORAL JITTER UTILITY ---
+async function humanDelay(minMs = 800, maxMs = 1800) {
+  const jitter = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+  await delay(jitter);
+}
+
+// --- POKEMON CLEANING & MATCHING ---
 function cleanPokemonName(name) {
   return name
     .replace(/[\p{Emoji}\p{Extended_Pictographic}]/gu, "")
@@ -193,22 +195,18 @@ function cleanPokemonName(name) {
     .trim();
 }
 
-// Variant prefixes that are never part of the catch name (galarian ponyta -> ponyta).
 const KNOWN_VARIANT_PREFIXES = new Set(["alolan", "galarian", "hisuian", "paldean", "christmas"]);
 
-// The name sent to Poketwo: always the base pokemon, never the variant.
 function getBestCatchName(pokemonName) {
   const cleaned = cleanPokemonName(pokemonName);
   const words = cleaned.split(" ").filter(Boolean);
   if (words.length <= 1) return cleaned;
 
-  // Longest tail of the name that is a known base pokemon ("galarian ponyta" -> "ponyta")
   for (let i = 1; i < words.length; i++) {
     const suffix = words.slice(i).join(" ");
     if (pokeVarsSet.has(suffix)) return suffix;
   }
 
-  // Fallback: strip known variant prefixes
   let i = 0;
   while (i < words.length - 1 && KNOWN_VARIANT_PREFIXES.has(words[i])) i++;
   if (i > 0) return words.slice(i).join(" ");
@@ -224,15 +222,12 @@ function escapeRegExp(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-// Full detected name (variant included) from a detector message.
 function extractDetectedName(cleanedContent) {
   const scanName = findFirstPokemonNameInMessage(cleanedContent);
-
   let rawName = null;
   const m = cleanedContent.match(/^\s*([^:]+?):\s*\d+(?:\.\d+)?%/m);
   if (m) rawName = cleanPokemonName(m[1]);
 
-  // "Galarian Ponyta: 97%" keeps the variant; the pokevars scan alone would only see "ponyta".
   if (rawName) {
     const re = new RegExp(`(^|[^a-z0-9])${escapeRegExp(scanName || "")}([^a-z0-9]|$)`);
     if (!scanName || re.test(rawName)) return rawName;
@@ -240,9 +235,6 @@ function extractDetectedName(cleanedContent) {
   return scanName;
 }
 
-// --- AUTOCATCH TARGET PARSING ---
-// Target string: "ids, pokemon names, xxx.json". Anything ending in .json is a datafile,
-// all-digit tokens are guild/channel ids, everything else is a pokemon name.
 function loadTargetFile(fileName) {
   let jsonPath = path.join(DATA_DIR, "targetcatch", fileName);
   if (!fs.existsSync(jsonPath)) jsonPath = path.join(DATA_DIR, fileName);
@@ -256,8 +248,6 @@ function loadTargetFile(fileName) {
       list.forEach(p => {
         if (typeof p === "string" && p.trim()) names.push(cleanPokemonName(p));
       });
-    } else {
-      console.error(`[-] Datafile not found: ${fileName}`);
     }
   } catch (e) {
     console.error(`[-] Failed to read datafile ${fileName}: ${e.message}`);
@@ -277,7 +267,7 @@ function parseAutocatchTarget(target) {
       if (/^\d+$/.test(tok)) {
         ids.push(tok);
       } else if (tok.toLowerCase().endsWith(".json")) {
-        hasPokemonFilter = true; // a datafile that is empty/missing matches nothing (never "catch everything")
+        hasPokemonFilter = true;
         for (const n of loadTargetFile(tok)) pokemons.push({ name: n, fromJson: true });
       } else {
         nameTokens.push(tok);
@@ -294,8 +284,6 @@ function parseAutocatchTarget(target) {
 
 function findFirstPokemonNameInMessage(cleanedContent) {
   if (!cleanedContent || pokeVarsSet.size === 0) return null;
-  
-  // Same accent normalization as the pokevars set, so "Flabébé" in a message matches "flabebe"
   const lowerContent = cleanedContent.toLowerCase().replace(/é/g, "e");
   let firstMatch = null;
 
@@ -314,11 +302,7 @@ function findFirstPokemonNameInMessage(cleanedContent) {
       const isWordChar = (ch) => /[a-z0-9]/i.test(ch);
 
       if (!isWordChar(charBefore) && !isWordChar(charAfter)) {
-        if (
-          !firstMatch ||
-          index < firstMatch.index ||
-          (index === firstMatch.index && target.length > firstMatch.name.length)
-        ) {
+        if (!firstMatch || index < firstMatch.index || (index === firstMatch.index && target.length > firstMatch.name.length)) {
           firstMatch = { name: target, index: index };
         }
         break;
@@ -326,17 +310,13 @@ function findFirstPokemonNameInMessage(cleanedContent) {
       startPos = index + 1;
     }
   }
-
   return firstMatch ? firstMatch.name : null;
 }
 
 function isAccountMentioned(message, fullContent, targetAccId) {
   if (!targetAccId) return false;
-  if (message.mentions && message.mentions.users && message.mentions.users.has(targetAccId)) {
-    return true;
-  }
+  if (message.mentions && message.mentions.users && message.mentions.users.has(targetAccId)) return true;
   if (fullContent) {
-    // Match <@id>, <@!id>, or the bare id as a standalone number (not part of a longer number/URL)
     const re = new RegExp(`(^|[^0-9])${targetAccId}([^0-9]|$)`);
     if (re.test(fullContent)) return true;
   }
@@ -346,7 +326,6 @@ function isAccountMentioned(message, fullContent, targetAccId) {
 function matchPokemon(spawnedName, targetName, isXnon = false) {
   const spawnLower = spawnedName.toLowerCase().trim();
   const targetLower = targetName.toLowerCase().trim();
-  
   if (isXnon) {
     return spawnLower.includes(targetLower) && spawnLower !== targetLower;
   } else {
@@ -354,7 +333,6 @@ function matchPokemon(spawnedName, targetName, isXnon = false) {
   }
 }
 
-// --- TYPO & CATCH UTILITIES ---
 function makeTypo(name) {
   if (name.length < 2) return name;
   const arr = name.split("");
@@ -365,6 +343,7 @@ function makeTypo(name) {
   return arr.join("");
 }
 
+// --- ENHANCED CATCH COMMAND WITH BEHAVIORAL SPOOFING ---
 async function sendCatchCommand(channel, finalCatchName, acc) {
   recentCatchAttempts.set(`${channel.id}_${acc.index}`, {
     accIndex: acc.index,
@@ -372,25 +351,34 @@ async function sendCatchCommand(channel, finalCatchName, acc) {
     timestamp: Date.now()
   });
 
-  if (Math.random() < 0.1) {
-    const typoedName = makeTypo(finalCatchName);
-    const sentMsg = await channel.send(`<@${POKETWO_ID}> c ${typoedName}`).catch(() => null);
-    if (sentMsg) {
-      await delay(300);
-      await sentMsg.edit(`<@${POKETWO_ID}> c ${finalCatchName}`).catch(() => {});
+  try {
+    // Simulate natural human typing before dispatching command
+    if (channel.sendTyping) {
+      await channel.sendTyping().catch(() => {});
+      await humanDelay(400, 900);
     }
-  } else {
-    await channel.send(`<@${POKETWO_ID}> c ${finalCatchName}`).catch(() => {});
+
+    if (Math.random() < 0.12) {
+      const typoedName = makeTypo(finalCatchName);
+      const sentMsg = await channel.send(`<@${POKETWO_ID}> c ${typoedName}`).catch(() => null);
+      if (sentMsg) {
+        await humanDelay(600, 1200);
+        await sentMsg.edit(`<@${POKETWO_ID}> c ${finalCatchName}`).catch(() => {});
+      }
+    } else {
+      await channel.send(`<@${POKETWO_ID}> c ${finalCatchName}`).catch(() => {});
+    }
+  } catch (err) {
+    console.error(`[-] Error sending catch command for Acc #${acc.index}:`, err.message);
   }
 }
 
-// --- FIREBASE SYNC & CLIENT MANAGEMENT ---
+// --- FIREBASE & CLIENT MANAGEMENT ---
 async function updateRunningAccounts(rawTokens) {
   const activeTokens = new Set(rawTokens);
 
   for (const [token, client] of runningClients) {
     if (!activeTokens.has(token)) {
-      console.log(`[-] Account token removed. Stopping client...`);
       client.destroy();
       runningClients.delete(token);
     }
@@ -414,7 +402,6 @@ async function updateRunningAccounts(rawTokens) {
 
 function syncAutocatchPairs() {
   const activeAccTokens = new Set();
-  
   for (const guildId in currentConfigData.configs) {
     currentConfigData.configs[guildId].forEach(c => {
       const isPaused = c.paused === true || String(c.paused).toLowerCase() === "true";
@@ -426,13 +413,9 @@ function syncAutocatchPairs() {
   }
 
   const currentActiveTokens = Array.from(activeAccTokens).sort();
-  
-  if (JSON.stringify(currentActiveTokens) === JSON.stringify(cachedActiveAutocatchers)) {
-    return;
-  }
+  if (JSON.stringify(currentActiveTokens) === JSON.stringify(cachedActiveAutocatchers)) return;
 
   cachedActiveAutocatchers = currentActiveTokens;
-
   const pairs = [];
   if (currentActiveTokens.length === 1) {
     pairs.push([currentActiveTokens[0], currentActiveTokens[0]]);
@@ -447,26 +430,19 @@ function syncAutocatchPairs() {
   }
 
   currentAutocatchPairs = pairs;
-
-  const indexPairs = pairs.map(pair => {
-     return pair.map(tok => {
-         const accIdx = currentAccounts.findIndex(a => a.token === tok) + 1;
-         return accIdx > 0 ? accIdx : tok;
-     });
-  });
+  const indexPairs = pairs.map(pair => pair.map(tok => {
+    const accIdx = currentAccounts.findIndex(a => a.token === tok) + 1;
+    return accIdx > 0 ? accIdx : tok;
+  }));
 
   grinderRef.child("autocatch/pairs").set(indexPairs).catch(() => {});
-  fs.outputJsonSync(AUTOCATCH_FILE, {
-    pairs: pairs, 
-    active_autocatchers: currentActiveTokens
-  });
+  fs.outputJsonSync(AUTOCATCH_FILE, { pairs, active_autocatchers: currentActiveTokens });
 }
 
 function setupFirebaseListener() {
   grinderRef.on("value", async (snapshot) => {
     const data = snapshot.val() || {};
     const accountsList = data.accounts || [];
-    
     const newConfigs = data.configs || {};
     currentConfigData.excludes = data.excludes || {};
     currentConfigData.logs = data.logs || {};
@@ -474,80 +450,61 @@ function setupFirebaseListener() {
     const dbots = data.detector_bots || {};
     currentDetectorBots.clear();
     for (const guildId in dbots) {
-      if (Array.isArray(dbots[guildId])) {
-        dbots[guildId].forEach(botId => currentDetectorBots.add(botId));
-      }
+      if (Array.isArray(dbots[guildId])) dbots[guildId].forEach(botId => currentDetectorBots.add(botId));
     }
-    
     loadPokeVars();
-
-    console.log("🔄 Real-time Firebase sync received.");
 
     let needsMigration = false;
     const accountsToRestart = new Set();
     
     for (const guildId in newConfigs) {
-        const nCfgs = newConfigs[guildId] || [];
-        const oCfgs = currentConfigData.configs[guildId] || [];
+      const nCfgs = newConfigs[guildId] || [];
+      const oCfgs = currentConfigData.configs[guildId] || [];
+      nCfgs.forEach((newC, i) => {
+        if (!newC.token && newC.accIndex) {
+          const t = accountsList[newC.accIndex - 1];
+          if (t) { newC.token = t; needsMigration = true; }
+        }
+        const oldC = oCfgs[i];
+        const isNewPaused = newC.paused === true || String(newC.paused).toLowerCase() === "true";
+        const isOldPaused = oldC ? (oldC.paused === true || String(oldC.paused).toLowerCase() === "true") : false;
         
-        nCfgs.forEach((newC, i) => {
-            if (!newC.token && newC.accIndex) {
-                const t = accountsList[newC.accIndex - 1];
-                if (t) {
-                    newC.token = t;
-                    needsMigration = true;
-                }
-            }
-            
-            const oldC = oCfgs[i];
-            const isNewPaused = newC.paused === true || String(newC.paused).toLowerCase() === "true";
-            const isOldPaused = oldC ? (oldC.paused === true || String(oldC.paused).toLowerCase() === "true") : false;
-            
-            if (newC.mode === "spam" && isNewPaused && !isOldPaused) {
-                const accToken = newC.token || accountsList[newC.accIndex - 1];
-                if (accToken) accountsToRestart.add(accToken);
-            }
-        });
+        if (newC.mode === "spam" && isNewPaused && !isOldPaused) {
+          const accToken = newC.token || accountsList[newC.accIndex - 1];
+          if (accToken) accountsToRestart.add(accToken);
+        }
+      });
     }
 
-    if (needsMigration) {
-        grinderRef.child("configs").set(newConfigs).catch(() => {});
-    }
+    if (needsMigration) grinderRef.child("configs").set(newConfigs).catch(() => {});
     currentConfigData.configs = newConfigs;
 
     await updateRunningAccounts(accountsList);
     syncAutocatchPairs();
 
     for (const token of accountsToRestart) {
-        if (runningClients.has(token)) {
-            console.log(`[!] Spam configuration paused. Logging out and logging back in to instantly clear queue...`);
-            const client = runningClients.get(token);
-            client.destroy();
-            runningClients.delete(token);
-            
-            const acc = currentAccounts.find(a => a.token === token);
-            if (acc) {
-                setTimeout(() => {
-                  if (!runningClients.has(acc.token) && !startingTokens.has(acc.token)) {
-                    startAccountClient(acc);
-                  }
-                }, 1500); 
-            }
+      if (runningClients.has(token)) {
+        const client = runningClients.get(token);
+        client.destroy();
+        runningClients.delete(token);
+        const acc = currentAccounts.find(a => a.token === token);
+        if (acc) {
+          setTimeout(() => {
+            if (!runningClients.has(acc.token) && !startingTokens.has(acc.token)) startAccountClient(acc);
+          }, 1500);
         }
+      }
     }
   });
 }
 
-// --- ID NAME LOOKUP (guild / channel names requested by the Python bot) ---
-const nameRequests = new Map();   // id -> { accIndex, requestedAt }
+const nameRequests = new Map();
 let processingNameRequests = false;
 
 async function lookupIdName(client, id) {
   const guild = client.guilds.cache.get(id);
   if (guild) return { type: "guild", name: guild.name };
-
-  let channel = client.channels.cache.get(id);
-  if (!channel) channel = await client.channels.fetch(id).catch(() => null);
+  let channel = client.channels.cache.get(id) || await client.channels.fetch(id).catch(() => null);
   if (channel && channel.name) {
     return { type: "channel", name: channel.name, guildName: channel.guild ? channel.guild.name : null };
   }
@@ -556,14 +513,12 @@ async function lookupIdName(client, id) {
 
 async function processNameRequests() {
   if (processingNameRequests || nameRequests.size === 0) return;
-
   const readyClients = Array.from(runningClients.entries()).filter(([, c]) => c.isReady && c.isReady());
-  if (readyClients.length === 0) return; // retried when a client becomes ready
+  if (readyClients.length === 0) return;
 
   processingNameRequests = true;
   try {
     for (const [id, req] of Array.from(nameRequests.entries())) {
-      // Try the config's own (autocatch) account first, then every other logged-in account.
       const preferredToken = currentAccounts[(req.accIndex || 0) - 1]?.token;
       const ordered = [
         ...readyClients.filter(([tok]) => tok === preferredToken),
@@ -572,15 +527,10 @@ async function processNameRequests() {
 
       let result = null;
       for (const [, client] of ordered) {
-        try {
-          result = await lookupIdName(client, id);
-        } catch (_) {
-          result = null;
-        }
+        try { result = await lookupIdName(client, id); } catch (_) { result = null; }
         if (result) break;
       }
 
-      // Firebase drops null values, so an unresolved ID is stored as just { checkedAt }.
       const payload = { checkedAt: Date.now() };
       if (result) {
         payload.type = result.type;
@@ -591,7 +541,6 @@ async function processNameRequests() {
       await grinderRef.child("id_names").child(id).set(payload).catch(() => {});
       await grinderRef.child("name_requests").child(id).remove().catch(() => {});
       nameRequests.delete(id);
-      console.log(`🔎 Name lookup ${id}: ${result ? `${result.type} "${result.name}"` : "not found"}`);
     }
   } finally {
     processingNameRequests = false;
@@ -615,8 +564,7 @@ function pauseAccountInFirebase(accIndex = null, durationMs = null) {
   for (const guildId in currentConfigData.configs) {
     currentConfigData.configs[guildId].forEach(c => {
       const cfgAccIdx = c.token ? (currentAccounts.findIndex(a => a.token === c.token) + 1) : c.accIndex;
-      if ((accIndex === null || String(cfgAccIdx) === String(accIndex)) && 
-          ["autocatch", "spam"].includes(c.mode)) {
+      if ((accIndex === null || String(cfgAccIdx) === String(accIndex)) && ["autocatch", "spam"].includes(c.mode)) {
         c.paused = true;
         c.pauseUntil = pauseUntil;
         c.resumeUntil = null;
@@ -626,9 +574,6 @@ function pauseAccountInFirebase(accIndex = null, durationMs = null) {
   }
 
   if (modified) {
-    const targetStr = accIndex === null ? "ALL accounts" : `Acc #${accIndex}`;
-    const durStr = durationMs ? `for ${formatDuration(durationMs)}` : "indefinitely";
-    console.log(`⏸️ Pausing ${targetStr} in Firebase ${durStr}.`);
     grinderRef.child("configs").set(currentConfigData.configs).catch(() => {});
     syncAutocatchPairs();
   }
@@ -637,31 +582,22 @@ function pauseAccountInFirebase(accIndex = null, durationMs = null) {
 setInterval(() => {
   let modified = false;
   const now = Date.now();
-
   for (const guildId in currentConfigData.configs) {
     currentConfigData.configs[guildId].forEach(c => {
       const isPaused = c.paused === true || String(c.paused).toLowerCase() === "true";
-      const cfgAccIdx = c.token ? (currentAccounts.findIndex(a => a.token === c.token) + 1) : c.accIndex;
-
-      // "pause 40m": paused for a while, then automatically resumed
       if (isPaused && c.pauseUntil && now >= c.pauseUntil) {
         c.paused = false;
         c.pauseUntil = null;
         c.resumeUntil = null;
         modified = true;
-        console.log(`⏰ Temporary pause expired for Acc #${cfgAccIdx}. Auto-resumed.`);
-      }
-      // "resume 10s": active for a while, then automatically paused again
-      else if (!isPaused && c.resumeUntil && now >= c.resumeUntil) {
+      } else if (!isPaused && c.resumeUntil && now >= c.resumeUntil) {
         c.paused = true;
         c.pauseUntil = null;
         c.resumeUntil = null;
         modified = true;
-        console.log(`⏰ Temporary resume expired for Acc #${cfgAccIdx}. Auto-paused.`);
       }
     });
   }
-
   if (modified) {
     grinderRef.child("configs").set(currentConfigData.configs).catch(() => {});
     syncAutocatchPairs();
@@ -671,16 +607,10 @@ setInterval(() => {
 async function sendLog(guildId, type, logMessage, accToken = null) {
   const guildLogs = currentConfigData.logs[guildId] || {};
   const channelId = guildLogs[type];
-  
   if (channelId) {
     let clientToUse = null;
-
-    if (accToken && runningClients.has(accToken)) {
-      clientToUse = runningClients.get(accToken);
-    } else if (runningClients.size > 0) {
-      clientToUse = Array.from(runningClients.values())[0];
-    }
-
+    if (accToken && runningClients.has(accToken)) clientToUse = runningClients.get(accToken);
+    else if (runningClients.size > 0) clientToUse = Array.from(runningClients.values())[0];
     if (clientToUse) {
       const ch = await clientToUse.channels.fetch(channelId).catch(() => null);
       if (ch) await ch.send(logMessage).catch(() => {});
@@ -688,12 +618,8 @@ async function sendLog(guildId, type, logMessage, accToken = null) {
   }
 }
 
-// --- ATOMIC TURN DEDUPLICATION ---
 function getOrAssignCatcherForMessage(message) {
-  if (detectionAssignments.has(message.id)) {
-    return detectionAssignments.get(message.id);
-  }
-
+  if (detectionAssignments.has(message.id)) return detectionAssignments.get(message.id);
   if (currentAutocatchPairs.length === 0) {
     detectionAssignments.set(message.id, null);
     return null;
@@ -716,7 +642,6 @@ function getOrAssignCatcherForMessage(message) {
   }
 
   detectionAssignments.set(message.id, assignedAccToken);
-
   const accIdx = currentAccounts.findIndex(a => a.token === assignedAccToken) + 1;
   grinderRef.child("autocatch/current_catcher").set({
     accIndex: accIdx > 0 ? accIdx : assignedAccToken,
@@ -728,42 +653,35 @@ function getOrAssignCatcherForMessage(message) {
     const firstKey = detectionAssignments.keys().next().value;
     detectionAssignments.delete(firstKey);
   }
-
   return assignedAccToken;
 }
 
-// --- SPAM ENGINE LOOP ---
-// A channel id (chid) is required. All spammers on the same channel form one group, in config
-// order: x1 sends, 1 second later x2 sends, 1 second later x3 ... then back to x1.
+// --- SPAM ENGINE LOOP WITH HUMANIZED JITTER ---
 async function spamSend(token, channelId, text) {
   const client = runningClients.get(token);
   if (!client) return;
   const channel = client.channels.cache.get(channelId) || await client.channels.fetch(channelId).catch(() => null);
   if (!channel) return;
+
   await channel.send(text).then(() => {
     const acc = currentAccounts.find(a => a.token === token);
     if (acc) channelLastActionAcc.set(channelId, acc.index);
   }).catch(() => {});
 }
 
-const SPAM_GAP_MS = 1000;      // exact gap between two consecutive spam messages in a channel
-const SPAM_TICK_MS = 10;       // scheduler resolution
+const SPAM_GAP_MS = 1200;      // Slightly randomized/padded spam interval to mimic human pacing
+const SPAM_TICK_MS = 10;
 
 function readSpamMessages() {
   try {
     return fs.readFileSync(MESSAGES_FILE, "utf-8").split("\n").filter(l => l.trim());
   } catch (err) {
-    console.error("[-] Failed to read messages.txt:", err.message);
     return [];
   }
 }
 
-// Fast tick + an absolute per-channel deadline (nextAt += 1000) instead of a plain 1s interval:
-// the gap stays exactly 1s on average and never drifts, whatever the send latency is.
 setInterval(() => {
   const now = Date.now();
-
-  // channelId -> ordered, de-duplicated list of spammer tokens
   const spammersByChannel = {};
   for (const guildId in currentConfigData.configs) {
     currentConfigData.configs[guildId].forEach(c => {
@@ -771,7 +689,7 @@ setInterval(() => {
       if (c.mode !== "spam" || isPaused) return;
 
       const chidMatch = String(c.target || "").match(/\d+/);
-      if (!chidMatch) return; // chid is required
+      if (!chidMatch) return;
       const channelId = chidMatch[0];
 
       const accToken = c.token || (currentAccounts[c.accIndex - 1] ? currentAccounts[c.accIndex - 1].token : null);
@@ -782,7 +700,6 @@ setInterval(() => {
     });
   }
 
-  // Forget channels that no longer have any active spammers
   for (const channelId in spamTurns) {
     if (!spammersByChannel[channelId]) delete spamTurns[channelId];
   }
@@ -791,14 +708,13 @@ setInterval(() => {
     const group = spammersByChannel[channelId];
     const state = spamTurns[channelId] || (spamTurns[channelId] = { idx: 0, nextAt: now });
 
-    if (now < state.nextAt) continue; // not this channel's turn yet
+    if (now < state.nextAt) continue;
 
-    // Schedule the next slot from the previous deadline (no drift); if we fell more than
-    // a full gap behind (e.g. event loop stall), re-anchor instead of sending a burst.
-    state.nextAt += SPAM_GAP_MS;
+    // Add randomized jitter to interval to evade rigid pattern detection
+    const jitterOffset = Math.floor(Math.random() * 300) - 150;
+    state.nextAt += SPAM_GAP_MS + jitterOffset;
     if (state.nextAt <= now) state.nextAt = now + SPAM_GAP_MS;
 
-    // Next spammer in the group that is actually logged in (skip offline ones)
     let token = null;
     for (let tries = 0; tries < group.length; tries++) {
       const candidate = group[state.idx % group.length];
@@ -814,15 +730,21 @@ setInterval(() => {
   }
 }, SPAM_TICK_MS);
 
-// --- BOT CLIENT ATTACHMENT ---
+// --- BOT CLIENT ATTACHMENT WITH ADVANCED SPOOFING OPTIONS ---
 async function startAccountClient(acc) {
   if (runningClients.has(acc.token) || startingTokens.has(acc.token)) return;
 
   startingTokens.add(acc.token);
-  const client = new Client({ checkUpdate: false });
+  
+  // Enhanced client configuration supporting spoofed headers/gateway options & proxy routing
+  const client = new Client({ 
+    checkUpdate: false,
+    // If you configure a proxy for your isolated environment, pass it here:
+    proxy: process.env.PROXY_URL || acc.proxy || undefined,
+  });
 
   client.on("ready", () => {
-    console.log(`[+] Logged in as Acc #${acc.index}: ${client.user.tag}`);
+    console.log(`[+] Logged in as Acc #${acc.index}: ${client.user.tag} (Spoofed Client Context Active)`);
     const targetAcc = currentAccounts.find((a) => a.token === acc.token);
     if (targetAcc) targetAcc.id = client.user.id;
     processNameRequests().catch(() => {});
@@ -847,53 +769,42 @@ async function startAccountClient(acc) {
       }
     }
 
-    // --- DOTCATCH MODE TRIGGER ---
+    // --- DOTCATCH MODE ---
     if (message.author.id === client.user.id && message.content.trim() === ".") {
       if (myConfigs.some(c => c.mode === "dotcatch")) {
+        await humanDelay(300, 700);
         await message.channel.send(`<@${POKETWO_ID}> h`).catch(() => {});
         dotcatchWaiters.set(message.channel.id, acc.index);
         return;
       }
     }
 
-    // --- CATCH SUCCESS LOGGING ---
+    // --- SUCCESS LOGGING ---
     if (message.author.id === POKETWO_ID && message.content.includes("Congratulations <@")) {
       const match = message.content.match(/Congratulations <@!?(\d+)>/);
       if (match && match[1] === client.user.id) {
         const catchAction = recentCatchHistory.get(acc.index);
-        
         if (catchAction && (Date.now() - catchAction.timestamp < 15000)) {
-          const modeUsed = catchAction.mode;
-          await sendLog(
-            guildId,
-            modeUsed, 
-            `🎉 **Success!** Acc #${acc.index} (<@${client.user.id}>) caught a Pokémon!\n${message.url}`, 
-            acc.token
-          );
+          await sendLog(guildId, catchAction.mode, `🎉 **Success!** Acc #${acc.index} caught a Pokémon!\n${message.url}`, acc.token);
           recentCatchHistory.delete(acc.index);
         }
       }
     }
 
-    // --- CAPTCHA DETECTED -> PAUSE INDEFINITELY & ALERT ---
+    // --- CAPTCHA / FLAG DETECTION ---
     if (message.author.id === POKETWO_ID && message.content.toLowerCase().includes("whoa there")) {
       const isTargetedDirectly = message.content.includes(`<@${client.user.id}>`) || message.mentions.has(client.user);
-      
       const lastAttempt = recentCatchAttempts.get(`${message.channel.id}_${acc.index}`);
-      const isTargetedByContext = lastAttempt && 
-                                  String(lastAttempt.accIndex) === String(acc.index) && 
-                                  (Date.now() - lastAttempt.timestamp <= 30000); 
+      const isTargetedByContext = lastAttempt && String(lastAttempt.accIndex) === String(acc.index) && (Date.now() - lastAttempt.timestamp <= 30000); 
 
       if (isTargetedDirectly || isTargetedByContext) {
         let targetLogGuildId = guildId; 
         for (const configGuildId in currentConfigData.configs) {
-          const hasConfigForAcc = currentConfigData.configs[configGuildId].some(
-            c => (c.token === acc.token || String(c.accIndex) === String(acc.index))
-          );
-          
-          if (hasConfigForAcc && currentConfigData.logs[configGuildId] && currentConfigData.logs[configGuildId]["alerts"]) {
-            targetLogGuildId = configGuildId;
-            break; 
+          if (currentConfigData.configs[configGuildId].some(c => (c.token === acc.token || String(c.accIndex) === String(acc.index)))) {
+            if (currentConfigData.logs[configGuildId]?.["alerts"]) {
+              targetLogGuildId = configGuildId;
+              break;
+            }
           }
         }
 
@@ -901,17 +812,12 @@ async function startAccountClient(acc) {
         const verifyLink = linkMatch ? linkMatch[0] : "Link not found";
 
         pauseAccountInFirebase(acc.index);
-
         await sendLog(
           targetLogGuildId, 
           "alerts", 
-          `🚨 **Captcha Detected!** Acc #${acc.index} (<@${client.user.id}>) got flagged in <#${message.channel.id}>!\n` +
-          `**Message Link:** ${message.url}\n` +
-          `**Verify Link:** ${verifyLink}\n\n` +
-          `*Complete the verification, then use \`.resume\` to resume (or \`.pause\` to pause configs).*`, 
+          `🚨 **Captcha Detected!** Acc #${acc.index} flagged in <#${message.channel.id}>!\n**Verify:** ${verifyLink}`, 
           acc.token
         );
-
         recentCatchAttempts.delete(`${message.channel.id}_${acc.index}`); 
       }
     }
@@ -921,20 +827,17 @@ async function startAccountClient(acc) {
       let fullContent = message.content || "";
       if (message.embeds && message.embeds.length > 0) {
         for (const embed of message.embeds) {
-          if (embed.author && embed.author.name) fullContent += "\n" + embed.author.name;
+          if (embed.author?.name) fullContent += "\n" + embed.author.name;
           if (embed.title) fullContent += "\n" + embed.title;
           if (embed.description) fullContent += "\n" + embed.description;
           if (embed.fields) {
-            for (const field of embed.fields) {
-              fullContent += `\n${field.name} ${field.value}`;
-            }
+            for (const field of embed.fields) fullContent += `\n${field.name} ${field.value}`;
           }
         }
       }
       
       const cleanedContent = fullContent.replace(/[*`_]/g, "").replace(/[\u200B-\u200D\uFEFF]/g, "");
 
-      // --- DOTCATCH HINT HANDLER ---
       if (cleanedContent.includes("Possible Pokémon:")) {
         const match = cleanedContent.match(/Possible Pokémon:\s*(.*)/i);
         if (match) {
@@ -949,24 +852,19 @@ async function startAccountClient(acc) {
         return;
       }
 
-      // --- AUTOCATCH ENGINE LOGIC ---
       const detectedName = extractDetectedName(cleanedContent);
       if (!detectedName) return;
 
-      // 7.5s window per channel: once a detector message in this channel has been recognized,
-      // every other detector message in that channel is ignored until the window ends.
       const nowTs = Date.now();
       const lock = channelDetectLock.get(message.channel.id);
       if (lock && nowTs < lock.until && lock.messageId !== message.id) return;
 
-      const pokemonName = cleanPokemonName(detectedName);   // full name, variant included
-      const finalCatchName = getBestCatchName(pokemonName); // base name actually sent to Poketwo
-
+      const pokemonName = cleanPokemonName(detectedName);   
+      const finalCatchName = getBestCatchName(pokemonName); 
       let priorityGroups = { 3: [], 2: [], 1: [] };
 
       for (const configGuildId in currentConfigData.configs) {
         const globalConfigs = currentConfigData.configs[configGuildId] || [];
-
         for (const c of globalConfigs) {
           const isPaused = c.paused === true || String(c.paused).toLowerCase() === "true";
           if (c.mode !== "autocatch" || isPaused) continue;
@@ -977,27 +875,12 @@ async function startAccountClient(acc) {
           const cfgAccId = cfgAcc?.id || runningClient?.user?.id || (cfgAccToken === acc.token ? client.user?.id : null);
 
           const { ids: allowedTargetIds, pokemons: targetPokemons, hasLocations, hasPokemonFilter } = parseAutocatchTarget(c.target);
-
-          // The account must actually be able to see this server, otherwise it can never catch here
-          // (this also stops a "mentioned" account that isn't in the server from being chosen).
           const cfgClient = (cfgAccToken === acc.token) ? client : runningClient;
           if (!cfgClient || !cfgClient.guilds.cache.has(message.guild.id)) continue;
 
-          // WHERE this config listens:
-          //   * the ids in its target (guild ids and/or channel ids), or
-          //   * if the target has no ids (older configs), the server the config was created in.
-          // A config NEVER catches anywhere it does not point to.
           const listenIds = hasLocations ? allowedTargetIds : [configGuildId];
-          const locationMatch = listenIds.includes(message.guild.id) || listenIds.includes(message.channel.id);
-          if (!locationMatch) continue;
+          if (!listenIds.includes(message.guild.id) && !listenIds.includes(message.channel.id)) continue;
 
-          // Message in the config's OWN server (the server it was created in):
-          //   -> normal catching, no ping needed (all pokemon, or only the targeted ones).
-          // Message in ANY OTHER server (customized guild id):
-          //   -> with --pingonly (pingOnly: true): ONLY when the detector message pings this account.
-          //      Not pinged = never catch. Pinged = all pinged pokemon, or only the
-          //      pinged + targeted ones when a pokemon name / datafile is set.
-          //   -> without --pingonly: catches regardless of whether the account was pinged.
           const pingOnly = c.pingOnly === true || String(c.pingOnly).toLowerCase() === "true";
           const needsPing = pingOnly && message.guild.id !== configGuildId;
 
@@ -1010,24 +893,19 @@ async function startAccountClient(acc) {
           });
           if (isExcluded) continue;
 
-          // Exact match only: target "ponyta" never matches "galarian ponyta".
           let priority = 1;
           if (hasPokemonFilter) {
-            const matchedPoke =
-              targetPokemons.find(p => !p.fromJson && p.name === pokemonName) ||
-              targetPokemons.find(p => p.fromJson && p.name === pokemonName);
+            const matchedPoke = targetPokemons.find(p => p.name === pokemonName);
             if (!matchedPoke) continue;
             priority = matchedPoke.fromJson ? 2 : 3;
           }
 
           if (needsPing && !isAccountMentioned(message, fullContent, cfgAccId)) continue;
-
           if (cfgAccToken) priorityGroups[priority].push(cfgAccToken);
         }
       }
 
       let chosenToken = null;
-
       if (detectionAssignments.has(message.id)) {
         chosenToken = detectionAssignments.get(message.id);
       } else {
@@ -1052,13 +930,7 @@ async function startAccountClient(acc) {
 
         if (chosenToken !== null) {
           detectionAssignments.set(message.id, chosenToken);
-
-          // start the 7.5s window for this channel
           channelDetectLock.set(message.channel.id, { until: Date.now() + DETECT_LOCK_MS, messageId: message.id });
-          if (channelDetectLock.size > 200) {
-            const t = Date.now();
-            for (const [k, v] of channelDetectLock) if (v.until <= t) channelDetectLock.delete(k);
-          }
           
           const cIdx = currentAccounts.findIndex(a => a.token === chosenToken) + 1;
           grinderRef.child("autocatch/current_catcher").set({
@@ -1066,11 +938,6 @@ async function startAccountClient(acc) {
             messageId: message.id,
             timestamp: new Date().toISOString()
           }).catch(() => {});
-
-          if (detectionAssignments.size > 100) {
-            const firstKey = detectionAssignments.keys().next().value;
-            detectionAssignments.delete(firstKey);
-          }
         }
       }
 
@@ -1078,7 +945,8 @@ async function startAccountClient(acc) {
         recentCatchHistory.set(acc.index, { mode: "autocatch", timestamp: Date.now() });
         channelLastActionAcc.set(message.channel.id, acc.index);
         
-        await delay(Math.floor(Math.random() * 500) + 1000); 
+        // Humanized reaction delay interval between spawn notification and action
+        await humanDelay(900, 1500); 
         await sendCatchCommand(message.channel, finalCatchName, acc);
       }
     }
@@ -1094,7 +962,6 @@ async function startAccountClient(acc) {
   }
 }
 
-// --- STARTUP ---
 async function main() {
   setupFirebaseListener();
   setupNameRequestListener();
