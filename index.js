@@ -1,8 +1,8 @@
 if (process.env.GRINDER_CHILD !== "1") {
   const { fork } = require("child_process");
-  const RESTART_DELAY_MS = 3000;      // wait before restarting
-  const MAX_DELAY_MS = 30000;         // cap for the backoff when it keeps crashing
-  const STABLE_AFTER_MS = 60000;      // if it ran this long, the crash counter resets
+  const RESTART_DELAY_MS = 3000;      
+  const MAX_DELAY_MS = 30000;         
+  const STABLE_AFTER_MS = 60000;      
 
   let child = null;
   let shuttingDown = false;
@@ -56,7 +56,7 @@ process.on("unhandledRejection", (reason) => {
   process.exit(1);
 });
 
-console.log("=== GRINDER ENGINE SCRIPT LAUNCHING (ENHANCED SPOOFING & BEHAVIOR) ===");
+console.log("=== GRINDER ENGINE SCRIPT LAUNCHING (ADVANCED SPOOFING & BEHAVIOR) ===");
 
 const { Client } = require("discord.js-selfbot-v13");
 const fs = require("fs-extra");
@@ -149,6 +149,43 @@ let recentCatchHistory = new Map();
 let channelLastActionAcc = new Map(); 
 const recentCatchAttempts = new Map(); 
 
+// --- ORGANIC SESSION & AFK TRACKER ---
+const accountSessionState = new Map(); // token -> { isAfk: boolean, nextStateChange: number }
+
+function updateAccountSession(token, client) {
+  const now = Date.now();
+  let state = accountSessionState.get(token);
+
+  if (!state) {
+    // Active window: 90 to 180 minutes
+    const activeDuration = (90 + Math.floor(Math.random() * 90)) * 60 * 1000;
+    state = { isAfk: false, nextStateChange: now + activeDuration };
+    accountSessionState.set(token, state);
+    if (client?.user) client.user.setStatus("online").catch(() => {});
+    return state;
+  }
+
+  if (now >= state.nextStateChange) {
+    if (!state.isAfk) {
+      // Transition to AFK break: 15 to 45 minutes
+      const breakDuration = (15 + Math.floor(Math.random() * 30)) * 60 * 1000;
+      state.isAfk = true;
+      state.nextStateChange = now + breakDuration;
+      console.log(`[behavior] Account entering organic AFK break for ${Math.round(breakDuration / 60000)}m`);
+      if (client?.user) client.user.setStatus("idle").catch(() => {});
+    } else {
+      // Return to active grinding: 90 to 180 minutes
+      const activeDuration = (90 + Math.floor(Math.random() * 90)) * 60 * 1000;
+      state.isAfk = false;
+      state.nextStateChange = now + activeDuration;
+      console.log(`[behavior] Account resuming active session for ${Math.round(activeDuration / 60000)}m`);
+      if (client?.user) client.user.setStatus("online").catch(() => {});
+    }
+  }
+
+  return state;
+}
+
 // --- UTILITIES ---
 function parseDuration(str) {
   if (!str) return null;
@@ -179,10 +216,37 @@ function delay(ms) {
   return new Promise((res) => setTimeout(res, ms));
 }
 
-// --- HUMAN BEHAVIORAL JITTER UTILITY ---
-async function humanDelay(minMs = 800, maxMs = 1800) {
-  const jitter = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
-  await delay(jitter);
+// --- GAUSSIAN / BELL-CURVE HUMAN REACTION DELAY ---
+function gaussianRandom(mean, stdDev) {
+  let u = 0, v = 0;
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+  const z = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+  return z * stdDev + mean;
+}
+
+async function humanReactionDelay(meanMs = 1800, stdDevMs = 450, minFloorMs = 950) {
+  let wait = Math.round(gaussianRandom(meanMs, stdDevMs));
+  
+  // 6% chance of a "distracted" pause (e.g. tabbed out or reading another channel)
+  if (Math.random() < 0.06) {
+    wait += Math.floor(Math.random() * 4500) + 2500;
+  }
+
+  wait = Math.max(minFloorMs, wait);
+  await delay(wait);
+}
+
+// --- PROPORTIONAL HUMAN TYPING SIMULATION ---
+async function simulateHumanTyping(channel, textToType) {
+  if (!channel || !channel.sendTyping) return;
+  try {
+    await channel.sendTyping().catch(() => {});
+    // Average human typing speed: ~160ms to 260ms per character + base cognitive start
+    const perCharMs = 160 + Math.floor(Math.random() * 100);
+    const typingTime = Math.min(5500, Math.max(650, textToType.length * perCharMs));
+    await delay(typingTime);
+  } catch (_) {}
 }
 
 // --- POKEMON CLEANING & MATCHING ---
@@ -343,7 +407,7 @@ function makeTypo(name) {
   return arr.join("");
 }
 
-// --- ENHANCED CATCH COMMAND WITH BEHAVIORAL SPOOFING ---
+// --- ENHANCED CATCH COMMAND WITH PROPORTIONAL TYPING & TYPO RECOVERY ---
 async function sendCatchCommand(channel, finalCatchName, acc) {
   recentCatchAttempts.set(`${channel.id}_${acc.index}`, {
     accIndex: acc.index,
@@ -352,17 +416,15 @@ async function sendCatchCommand(channel, finalCatchName, acc) {
   });
 
   try {
-    // Simulate natural human typing before dispatching command
-    if (channel.sendTyping) {
-      await channel.sendTyping().catch(() => {});
-      await humanDelay(400, 900);
-    }
+    const commandText = `@Pokétwo c ${finalCatchName}`;
+    await simulateHumanTyping(channel, commandText);
 
-    if (Math.random() < 0.12) {
+    // 10% chance of making a human transposition typo and editing it
+    if (Math.random() < 0.10 && finalCatchName.length > 3) {
       const typoedName = makeTypo(finalCatchName);
       const sentMsg = await channel.send(`<@${POKETWO_ID}> c ${typoedName}`).catch(() => null);
       if (sentMsg) {
-        await humanDelay(600, 1200);
+        await humanReactionDelay(1100, 300, 700);
         await sentMsg.edit(`<@${POKETWO_ID}> c ${finalCatchName}`).catch(() => {});
       }
     } else {
@@ -381,6 +443,7 @@ async function updateRunningAccounts(rawTokens) {
     if (!activeTokens.has(token)) {
       client.destroy();
       runningClients.delete(token);
+      accountSessionState.delete(token);
     }
   }
 
@@ -395,6 +458,8 @@ async function updateRunningAccounts(rawTokens) {
 
   for (const acc of currentAccounts) {
     if (!runningClients.has(acc.token) && !startingTokens.has(acc.token)) {
+      // Stagger logins across multiple accounts so they don't all hit the gateway simultaneously
+      await delay(1500 + Math.floor(Math.random() * 2500));
       await startAccountClient(acc);
     }
   }
@@ -656,12 +721,23 @@ function getOrAssignCatcherForMessage(message) {
   return assignedAccToken;
 }
 
-// --- SPAM ENGINE LOOP WITH HUMANIZED JITTER ---
+// --- SPAM ENGINE LOOP WITH ORGANIC PACING & AFK BREAKS ---
 async function spamSend(token, channelId, text) {
   const client = runningClients.get(token);
   if (!client) return;
+
+  // Respect organic AFK session breaks
+  const session = updateAccountSession(token, client);
+  if (session.isAfk) return;
+
   const channel = client.channels.cache.get(channelId) || await client.channels.fetch(channelId).catch(() => null);
   if (!channel) return;
+
+  // Brief typing burst for realism
+  if (channel.sendTyping && Math.random() < 0.45) {
+    await channel.sendTyping().catch(() => {});
+    await delay(250 + Math.floor(Math.random() * 450));
+  }
 
   await channel.send(text).then(() => {
     const acc = currentAccounts.find(a => a.token === token);
@@ -669,8 +745,8 @@ async function spamSend(token, channelId, text) {
   }).catch(() => {});
 }
 
-const SPAM_GAP_MS = 1200;      // Slightly randomized/padded spam interval to mimic human pacing
-const SPAM_TICK_MS = 10;
+const SPAM_BASE_GAP_MS = 1850; // Increased base interval to avoid rapid velocity triggers
+const SPAM_TICK_MS = 50;
 
 function readSpamMessages() {
   try {
@@ -710,10 +786,11 @@ setInterval(() => {
 
     if (now < state.nextAt) continue;
 
-    // Add randomized jitter to interval to evade rigid pattern detection
-    const jitterOffset = Math.floor(Math.random() * 300) - 150;
-    state.nextAt += SPAM_GAP_MS + jitterOffset;
-    if (state.nextAt <= now) state.nextAt = now + SPAM_GAP_MS;
+    // Wide non-uniform jitter + occasional micro-pause (3 to 8 seconds)
+    let jitterOffset = Math.floor(gaussianRandom(0, 450));
+    if (Math.random() < 0.08) jitterOffset += 3000 + Math.floor(Math.random() * 5000);
+
+    state.nextAt = now + Math.max(1100, SPAM_BASE_GAP_MS + jitterOffset);
 
     let token = null;
     for (let tries = 0; tries < group.length; tries++) {
@@ -730,23 +807,36 @@ setInterval(() => {
   }
 }, SPAM_TICK_MS);
 
-// --- BOT CLIENT ATTACHMENT WITH ADVANCED SPOOFING OPTIONS ---
+// --- BOT CLIENT ATTACHMENT WITH RESIDENTIAL PROXY & REALISTIC TELEMETRY ---
 async function startAccountClient(acc) {
   if (runningClients.has(acc.token) || startingTokens.has(acc.token)) return;
 
   startingTokens.add(acc.token);
   
-  // Enhanced client configuration supporting spoofed headers/gateway options & proxy routing
+  const proxyUrl = process.env.PROXY_URL || acc.proxy || undefined;
+  if (proxyUrl) {
+    console.log(`[network] Routing Acc #${acc.index} through configured proxy.`);
+  } else {
+    console.warn(`[WARNING] Acc #${acc.index} has no proxy configured! Running on datacenter IP increases flag risk.`);
+  }
+
   const client = new Client({ 
     checkUpdate: false,
-    // If you configure a proxy for your isolated environment, pass it here:
-    proxy: process.env.PROXY_URL || acc.proxy || undefined,
+    proxy: proxyUrl,
+    ws: {
+      properties: {
+        browser: "Discord Client",
+        os: "Windows",
+        device: "Desktop"
+      }
+    }
   });
 
   client.on("ready", () => {
-    console.log(`[+] Logged in as Acc #${acc.index}: ${client.user.tag} (Spoofed Client Context Active)`);
+    console.log(`[+] Logged in as Acc #${acc.index}: ${client.user.tag}`);
     const targetAcc = currentAccounts.find((a) => a.token === acc.token);
     if (targetAcc) targetAcc.id = client.user.id;
+    updateAccountSession(acc.token, client);
     processNameRequests().catch(() => {});
   });
 
@@ -772,7 +862,7 @@ async function startAccountClient(acc) {
     // --- DOTCATCH MODE ---
     if (message.author.id === client.user.id && message.content.trim() === ".") {
       if (myConfigs.some(c => c.mode === "dotcatch")) {
-        await humanDelay(300, 700);
+        await humanReactionDelay(600, 150, 350);
         await message.channel.send(`<@${POKETWO_ID}> h`).catch(() => {});
         dotcatchWaiters.set(message.channel.id, acc.index);
         return;
@@ -824,6 +914,10 @@ async function startAccountClient(acc) {
 
     // --- DETECTOR BOT HANDLER ---
     if (currentDetectorBots.has(message.author.id)) {
+      // Check if account is currently in an organic AFK break
+      const session = updateAccountSession(acc.token, client);
+      if (session.isAfk) return;
+
       let fullContent = message.content || "";
       if (message.embeds && message.embeds.length > 0) {
         for (const embed of message.embeds) {
@@ -918,6 +1012,11 @@ async function startAccountClient(acc) {
           chosenToken = priorityGroups[2][turn % priorityGroups[2].length];
           pairTurnStates.set("p2", turn + 1);
         } else if (priorityGroups[1].length > 0) {
+          // 10% chance to organically "miss" a low-priority spawn so catch rate isn't 100.0%
+          if (Math.random() < 0.10) {
+            detectionAssignments.set(message.id, null);
+            return;
+          }
           const assignedToken = getOrAssignCatcherForMessage(message); 
           if (assignedToken && priorityGroups[1].includes(assignedToken)) {
             chosenToken = assignedToken;
@@ -945,8 +1044,8 @@ async function startAccountClient(acc) {
         recentCatchHistory.set(acc.index, { mode: "autocatch", timestamp: Date.now() });
         channelLastActionAcc.set(message.channel.id, acc.index);
         
-        // Humanized reaction delay interval between spawn notification and action
-        await humanDelay(900, 1500); 
+        // Bell-curve reaction delay before starting to type
+        await humanReactionDelay(1750, 450, 950); 
         await sendCatchCommand(message.channel, finalCatchName, acc);
       }
     }
